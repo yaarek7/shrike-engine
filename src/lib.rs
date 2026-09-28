@@ -8,6 +8,8 @@
 
 /// Chess-domain types and position representation.
 pub mod chess;
+/// Position evaluation implementations and score types.
+pub mod eval;
 /// Universal Chess Interface protocol support.
 pub mod uci;
 

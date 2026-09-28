@@ -5,9 +5,9 @@ development process.
 
 ## Status
 
-Milestone M4 is complete: the engine has validated orthodox chess rules and a functional UCI
-process supporting handshake, readiness, new-game notification, FEN/start-position setup, legal move
-application, `go`, `stop`, and `quit`. Move choice remains deterministic until search arrives.
+Milestone M5 is complete: the engine adds a replaceable classical evaluator with centipawn material,
+piece activity, mobility, pawn structure, and king safety components. The UCI process remains
+functional, while move choice remains deterministic until search arrives.
 
 ## Requirements
 

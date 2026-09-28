@@ -14,12 +14,12 @@ The package produces:
 - `chess-engine`, a thin executable that will eventually adapt standard input and output to the
   library's UCI protocol API.
 
-M4 adds a synchronous, library-testable UCI boundary and a functional stdin/stdout executable.
+M5 adds a modular classical evaluator with independently observable score components.
+M4 provides a synchronous, library-testable UCI boundary and a functional stdin/stdout executable.
 The `chess` module contains strongly typed domain
 values, twelve piece bitboards, complete FEN position state, strict FEN syntax parsing, two-byte
 moves, attack detection, legal move generation, validated make/unmake, and perft. Protocol,
-evaluation, and search remain outside the chess-rules layer; evaluation and search are not yet
-implemented.
+evaluation, and search remain outside the chess-rules layer; search is not yet implemented.
 
 ## Intended module progression
 
@@ -31,7 +31,7 @@ src/
 ├── main.rs
 ├── chess/       # Position, FEN, moves, attacks, legal generation, and perft
 ├── uci/         # Synchronous protocol parsing and session state
-├── eval/        # Replaceable evaluation implementations
+├── eval/        # Classical baseline behind a replaceable evaluator trait
 ├── search/      # Search, ordering, time management, transposition table
 └── engine.rs    # Coordination without protocol-specific I/O
 ```
