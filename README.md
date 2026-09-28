@@ -5,10 +5,10 @@ development process.
 
 ## Status
 
-The engine now has a tournament-facing search controller above the M8 alpha-beta and quiescence
-core. It performs iterative deepening, supports deterministic node limits and wall-clock budgets,
-can be interrupted by UCI `stop`, and reports cumulative nodes, elapsed time, NPS, score, and PV
-after every completed iteration. Draw-aware history remains part of every iteration.
+The engine now has an explicit search composition boundary above the tournament controller.
+`SearchBackend` implementations can be injected into UCI, while `AlphaBetaSearcher` owns a
+replaceable evaluator and independently selectable quiescence and move-ordering policies. This
+supports same-build A/B tests without virtual dispatch inside the node hot path.
 
 ## Requirements
 

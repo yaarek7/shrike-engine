@@ -11,7 +11,9 @@ use crate::{
     EngineInfo,
     chess::{Color, Move, Position, RepetitionKey},
     eval::ClassicalEvaluator,
-    search::{IterationInfo, SearchLimits, StopToken, iterative_search_with_history},
+    search::{
+        AlphaBetaConfig, AlphaBetaSearcher, IterationInfo, SearchBackend, SearchLimits, StopToken,
+    },
 };
 
 /// Runs a UCI session until end-of-input or the `quit` command.
@@ -23,7 +25,29 @@ use crate::{
 ///
 /// Returns an I/O error if reading a command or writing a response fails.
 pub fn run<R: BufRead, W: Write + Send>(reader: &mut R, writer: &mut W) -> io::Result<()> {
-    thread::scope(|scope| {
+    run_with_backend(
+        reader,
+        writer,
+        Arc::new(AlphaBetaSearcher::new(
+            ClassicalEvaluator,
+            AlphaBetaConfig::default(),
+        )),
+    )
+}
+
+/// Runs a UCI session with an injected search backend.
+///
+/// This is the root composition boundary for same-build experiments.
+///
+/// # Errors
+///
+/// Returns an I/O error if reading a command, writing a response, or joining search fails.
+pub fn run_with_backend<R: BufRead, W: Write + Send>(
+    reader: &mut R,
+    writer: &mut W,
+    backend: Arc<dyn SearchBackend>,
+) -> io::Result<()> {
+    thread::scope(move |scope| {
         let output = Arc::new(Mutex::new(writer));
         let mut session = Session::default();
         let mut active: Option<(StopToken, thread::ScopedJoinHandle<'_, io::Result<()>>)> = None;
@@ -71,12 +95,14 @@ pub fn run<R: BufRead, W: Write + Send>(reader: &mut R, writer: &mut W) -> io::R
                             let stop = StopToken::default();
                             let worker_stop = stop.clone();
                             let worker_output = Arc::clone(&output);
+                            let worker_backend = Arc::clone(&backend);
                             let handle = scope.spawn(move || {
                                 run_search_worker(
                                     &position,
                                     &prior,
                                     limits,
                                     &worker_stop,
+                                    worker_backend.as_ref(),
                                     &worker_output,
                                 )
                             });
@@ -267,18 +293,18 @@ fn run_search_worker<W: Write>(
     prior: &[RepetitionKey],
     limits: SearchLimits,
     stop: &StopToken,
+    backend: &dyn SearchBackend,
     output: &Arc<Mutex<&mut W>>,
 ) -> io::Result<()> {
     let mut output_error = None;
-    let outcome =
-        iterative_search_with_history(position, &ClassicalEvaluator, prior, limits, stop, |info| {
-            if output_error.is_none() {
-                output_error = with_output(output, |writer| write_search_info(writer, info)).err();
-                if output_error.is_some() {
-                    stop.stop();
-                }
+    let outcome = backend.iterative_search(position, prior, limits, stop, &mut |info| {
+        if output_error.is_none() {
+            output_error = with_output(output, |writer| write_search_info(writer, info)).err();
+            if output_error.is_some() {
+                stop.stop();
             }
-        });
+        }
+    });
     if let Some(error) = output_error {
         return Err(error);
     }
@@ -364,12 +390,17 @@ mod tests {
     use std::{
         collections::VecDeque,
         io::{self, BufRead, Read},
+        sync::Arc,
         thread,
         time::Duration,
     };
 
-    use super::{parse_go, run};
-    use crate::chess::{Color, Move, Position};
+    use super::{parse_go, run, run_with_backend};
+    use crate::{
+        chess::{Color, Move, Position},
+        eval::{Evaluator, Score},
+        search::{AlphaBetaConfig, AlphaBetaSearcher, QuiescencePolicy, SearchBackend},
+    };
 
     fn transcript(input: &str) -> String {
         let mut reader = ScriptedReader {
@@ -378,6 +409,16 @@ mod tests {
         };
         let mut output = Vec::new();
         run(&mut reader, &mut output).expect("in-memory I/O succeeds");
+        String::from_utf8(output).expect("protocol output is UTF-8")
+    }
+
+    fn transcript_with_backend(input: &str, backend: Arc<dyn SearchBackend>) -> String {
+        let mut reader = ScriptedReader {
+            lines: input.split_inclusive('\n').map(str::to_owned).collect(),
+            delay_next: false,
+        };
+        let mut output = Vec::new();
+        run_with_backend(&mut reader, &mut output, backend).expect("in-memory I/O succeeds");
         String::from_utf8(output).expect("protocol output is UTF-8")
     }
 
@@ -452,6 +493,30 @@ mod tests {
         );
 
         assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn uci_accepts_an_injected_search_composition() {
+        struct ConstantEvaluator;
+
+        impl Evaluator for ConstantEvaluator {
+            fn evaluate(&self, _position: &Position) -> Score {
+                Score::from_centipawns(123)
+            }
+        }
+
+        let backend = AlphaBetaSearcher::new(
+            ConstantEvaluator,
+            AlphaBetaConfig {
+                quiescence: QuiescencePolicy::Disabled,
+                ..AlphaBetaConfig::default()
+            },
+        );
+        let output =
+            transcript_with_backend("position startpos\ngo depth 1\nquit\n", Arc::new(backend));
+
+        assert!(output.contains("info depth 1 score cp -123 "));
+        assert_legal_bestmove(&output, &Position::starting());
     }
 
     #[test]

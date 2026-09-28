@@ -14,10 +14,13 @@ The package produces:
 - `chess-engine`, a thin executable that will eventually adapt standard input and output to the
   library's UCI protocol API.
 
-The search controller adds iterative deepening, node and time budgets, cooperative cancellation,
-and completed-iteration reporting. UCI runs search on a scoped worker so protocol input remains
-responsive to `stop`, `isready`, and `quit`, while output remains serialized. M8 adds bounded
-quiescence search over captures, promotions, and all legal check evasions. It
+The search composition boundary separates UCI from methodology through `SearchBackend`.
+`AlphaBetaSearcher<E>` statically owns its evaluator and explicit policy configuration; dynamic
+dispatch occurs only once at the root. The search controller adds iterative deepening, node and
+time budgets, cooperative cancellation, and completed-iteration reporting. UCI runs search on a
+scoped worker so protocol input remains responsive to `stop`, `isready`, and `quit`, while output
+remains serialized. M8 adds bounded quiescence search over captures, promotions, and all legal
+check evasions. It
 stabilizes tactical leaf evaluation while retaining deterministic search, total and quiescence
 node measurements, and nominal-depth principal variations. M7 provides deterministic incremental
 repetition keys and draw-aware search using explicit game history, the halfmove clock, and
@@ -58,9 +61,9 @@ The protocol layer may depend on the engine API. The engine may depend on chess,
 and search abstractions. Core chess representation must not depend on UCI, evaluation, or search.
 
 ```text
-binary → UCI → search → evaluation
-          ↓       ↓
-        chess ←─────┘
+binary → UCI → SearchBackend → configured search → evaluation
+          ↓              ↓                ↓
+        chess ←───────────────────────────┘
 ```
 
 ## Invariants
@@ -73,6 +76,7 @@ binary → UCI → search → evaluation
 6. Hot-path allocations will be measured and controlled once hot paths exist.
 7. Repetition history is explicit search input and remains conceptually separate from future
    transposition-table identity and storage.
+8. Search experiments compose at the root; hot node recursion does not use trait-object dispatch.
 
 ## Decision records
 

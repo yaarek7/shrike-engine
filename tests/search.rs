@@ -1,10 +1,82 @@
-//! Public integration tests for fixed-depth search.
+//! Public integration tests for search composition and fixed-depth search.
+
+use std::time::Duration;
 
 use chess_engine::{
-    chess::{Move, Position},
-    eval::ClassicalEvaluator,
-    search::{search, search_with_history},
+    chess::{Move, Position, RepetitionKey},
+    eval::{ClassicalEvaluator, Score},
+    search::{
+        IterationInfo, IterativeSearchResult, SearchBackend, SearchError, SearchLimits,
+        SearchResult, SearchTermination, StopToken, search, search_with_history,
+    },
 };
+
+struct FirstLegalMoveBackend;
+
+impl SearchBackend for FirstLegalMoveBackend {
+    fn fixed_search(
+        &self,
+        position: &Position,
+        _prior_position_keys: &[RepetitionKey],
+        depth: u8,
+    ) -> Result<SearchResult, SearchError> {
+        if !(1..=64).contains(&depth) {
+            return Err(SearchError::InvalidDepth(depth));
+        }
+
+        let best_move = position.legal_moves()?.into_iter().next();
+        let principal_variation = best_move.into_iter().collect();
+        Ok(SearchResult::new(
+            depth,
+            Score::ZERO,
+            1,
+            0,
+            best_move,
+            principal_variation,
+        ))
+    }
+
+    fn iterative_search(
+        &self,
+        position: &Position,
+        prior_position_keys: &[RepetitionKey],
+        limits: SearchLimits,
+        _stop: &StopToken,
+        on_iteration: &mut dyn FnMut(&IterationInfo),
+    ) -> Result<IterativeSearchResult, SearchError> {
+        let result = self.fixed_search(position, prior_position_keys, limits.depth)?;
+        on_iteration(&IterationInfo::new(result.clone(), 1, Duration::ZERO));
+
+        Ok(IterativeSearchResult::new(
+            Some(result.clone()),
+            result.best_move(),
+            1,
+            Duration::ZERO,
+            SearchTermination::Completed,
+        ))
+    }
+}
+
+#[test]
+fn public_search_backend_can_be_implemented_and_injected_externally() {
+    let backend: &dyn SearchBackend = &FirstLegalMoveBackend;
+    let position = Position::starting();
+    let mut reported_depth = None;
+    let result = backend
+        .iterative_search(
+            &position,
+            &[],
+            SearchLimits::depth(2),
+            &StopToken::default(),
+            &mut |iteration| reported_depth = Some(iteration.result().depth()),
+        )
+        .expect("custom backend search succeeds");
+
+    assert_eq!(reported_depth, Some(2));
+    assert_eq!(result.completed().map(SearchResult::depth), Some(2));
+    assert!(result.best_move().is_some());
+    assert_eq!(result.termination(), SearchTermination::Completed);
+}
 
 #[test]
 fn public_search_result_is_legal_replayable_and_deterministic() {

@@ -26,6 +26,135 @@ const MATE_SCORE: i32 = 900_000;
 const MATE_THRESHOLD: i32 = MATE_SCORE - (MAX_DEPTH as i32 + MAX_QUIESCENCE_PLY as i32 + 1);
 const MAX_STATIC_SCORE: i32 = 100_000;
 
+/// Leaf-search policy used by [`AlphaBetaSearcher`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum QuiescencePolicy {
+    /// Stabilize nominal leaves with bounded tactical search.
+    #[default]
+    Enabled,
+    /// Evaluate nominal leaves directly after terminal and draw adjudication.
+    Disabled,
+}
+
+/// Move-ordering policy used by [`AlphaBetaSearcher`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum MoveOrderingPolicy {
+    /// Search captures and promotions first, then use compact move encoding as a tie-breaker.
+    #[default]
+    Tactical,
+    /// Order only by compact move encoding, providing a deterministic comparison baseline.
+    Encoded,
+}
+
+/// Independently selectable alpha-beta search policies.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct AlphaBetaConfig {
+    /// Nominal-leaf stabilization policy.
+    pub quiescence: QuiescencePolicy,
+    /// Legal-move ordering policy.
+    pub move_ordering: MoveOrderingPolicy,
+}
+
+/// Root-level search interface used by engine and protocol composition.
+///
+/// Implementations may use dynamic dispatch here without adding virtual calls to the node hot path.
+pub trait SearchBackend: Send + Sync {
+    /// Performs one exact-depth search with explicit game history.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] when depth or the root position is invalid.
+    fn fixed_search(
+        &self,
+        position: &Position,
+        prior_position_keys: &[RepetitionKey],
+        depth: u8,
+    ) -> Result<SearchResult, SearchError>;
+
+    /// Performs controlled iterative deepening and reports completed iterations.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] when the configured depth or root position is invalid.
+    fn iterative_search(
+        &self,
+        position: &Position,
+        prior_position_keys: &[RepetitionKey],
+        limits: SearchLimits,
+        stop: &StopToken,
+        on_iteration: &mut dyn FnMut(&IterationInfo),
+    ) -> Result<IterativeSearchResult, SearchError>;
+}
+
+/// Statically dispatched alpha-beta backend with an owned evaluator and explicit policies.
+#[derive(Debug, Clone)]
+pub struct AlphaBetaSearcher<E> {
+    evaluator: E,
+    config: AlphaBetaConfig,
+}
+
+impl<E> AlphaBetaSearcher<E> {
+    /// Creates an alpha-beta backend from its replaceable components.
+    #[must_use]
+    pub const fn new(evaluator: E, config: AlphaBetaConfig) -> Self {
+        Self { evaluator, config }
+    }
+
+    /// Returns the active search policy configuration.
+    #[must_use]
+    pub const fn config(&self) -> AlphaBetaConfig {
+        self.config
+    }
+
+    /// Returns the owned evaluator.
+    #[must_use]
+    pub const fn evaluator(&self) -> &E {
+        &self.evaluator
+    }
+}
+
+impl<E: Default> Default for AlphaBetaSearcher<E> {
+    fn default() -> Self {
+        Self::new(E::default(), AlphaBetaConfig::default())
+    }
+}
+
+impl<E: Evaluator + Send + Sync> SearchBackend for AlphaBetaSearcher<E> {
+    fn fixed_search(
+        &self,
+        position: &Position,
+        prior_position_keys: &[RepetitionKey],
+        depth: u8,
+    ) -> Result<SearchResult, SearchError> {
+        search_with_configuration(
+            position,
+            &self.evaluator,
+            depth,
+            prior_position_keys,
+            self.config,
+        )
+    }
+
+    fn iterative_search(
+        &self,
+        position: &Position,
+        prior_position_keys: &[RepetitionKey],
+        limits: SearchLimits,
+        stop: &StopToken,
+        on_iteration: &mut dyn FnMut(&IterationInfo),
+    ) -> Result<IterativeSearchResult, SearchError> {
+        iterative_search_with_configuration(
+            position,
+            &self.evaluator,
+            prior_position_keys,
+            limits,
+            stop,
+            self.config,
+            on_iteration,
+        )
+    }
+}
+
 /// A clonable cancellation signal for an active search.
 #[derive(Debug, Clone, Default)]
 pub struct StopToken(Arc<AtomicBool>);
@@ -88,6 +217,16 @@ pub struct IterationInfo {
 }
 
 impl IterationInfo {
+    /// Creates a completed-iteration event for a custom [`SearchBackend`].
+    #[must_use]
+    pub const fn new(result: SearchResult, nodes: u64, elapsed: Duration) -> Self {
+        Self {
+            result,
+            nodes,
+            elapsed,
+        }
+    }
+
     /// Returns the completed fixed-depth result.
     #[must_use]
     pub const fn result(&self) -> &SearchResult {
@@ -118,6 +257,26 @@ pub struct IterativeSearchResult {
 }
 
 impl IterativeSearchResult {
+    /// Creates a controller outcome for a custom [`SearchBackend`].
+    ///
+    /// Backend implementations are responsible for ensuring `best_move` is legal at their root.
+    #[must_use]
+    pub const fn new(
+        completed: Option<SearchResult>,
+        best_move: Option<Move>,
+        nodes: u64,
+        elapsed: Duration,
+        termination: SearchTermination,
+    ) -> Self {
+        Self {
+            completed,
+            best_move,
+            nodes,
+            elapsed,
+            termination,
+        }
+    }
+
     /// Returns the last fully completed iteration, if depth one completed.
     #[must_use]
     pub const fn completed(&self) -> Option<&SearchResult> {
@@ -196,6 +355,29 @@ pub struct SearchResult {
 }
 
 impl SearchResult {
+    /// Creates a completed result for a custom [`SearchBackend`].
+    ///
+    /// Backend implementations are responsible for score perspective, legal move/PV content, and
+    /// internally consistent node counts.
+    #[must_use]
+    pub fn new(
+        depth: u8,
+        score: Score,
+        nodes: u64,
+        quiescence_nodes: u64,
+        best_move: Option<Move>,
+        principal_variation: Vec<Move>,
+    ) -> Self {
+        Self {
+            depth,
+            score,
+            nodes,
+            quiescence_nodes,
+            best_move,
+            principal_variation,
+        }
+    }
+
     /// Returns the requested search depth.
     #[must_use]
     pub const fn depth(&self) -> u8 {
@@ -282,6 +464,22 @@ pub fn search_with_history(
     depth: u8,
     prior_position_keys: &[RepetitionKey],
 ) -> Result<SearchResult, SearchError> {
+    search_with_configuration(
+        position,
+        evaluator,
+        depth,
+        prior_position_keys,
+        AlphaBetaConfig::default(),
+    )
+}
+
+fn search_with_configuration(
+    position: &Position,
+    evaluator: &dyn Evaluator,
+    depth: u8,
+    prior_position_keys: &[RepetitionKey],
+    config: AlphaBetaConfig,
+) -> Result<SearchResult, SearchError> {
     if !(1..=MAX_DEPTH).contains(&depth) {
         return Err(SearchError::InvalidDepth(depth));
     }
@@ -293,6 +491,7 @@ pub fn search_with_history(
         depth,
         prior_position_keys,
         IterationControl::unlimited(),
+        config,
     );
     debug_assert_eq!(termination, None);
     Ok(result)
@@ -319,6 +518,26 @@ pub fn iterative_search_with_history<F>(
 where
     F: FnMut(&IterationInfo),
 {
+    iterative_search_with_configuration(
+        position,
+        evaluator,
+        prior_position_keys,
+        limits,
+        stop,
+        AlphaBetaConfig::default(),
+        &mut on_iteration,
+    )
+}
+
+fn iterative_search_with_configuration(
+    position: &Position,
+    evaluator: &dyn Evaluator,
+    prior_position_keys: &[RepetitionKey],
+    limits: SearchLimits,
+    stop: &StopToken,
+    config: AlphaBetaConfig,
+    on_iteration: &mut dyn FnMut(&IterationInfo),
+) -> Result<IterativeSearchResult, SearchError> {
     if !(1..=MAX_DEPTH).contains(&limits.depth) {
         return Err(SearchError::InvalidDepth(limits.depth));
     }
@@ -348,6 +567,7 @@ where
                 deadline,
                 node_limit: remaining_nodes,
             },
+            config,
         );
         total_nodes = total_nodes.saturating_add(result.nodes());
         if let Some(reason) = interrupted {
@@ -383,6 +603,7 @@ fn run_iteration(
     depth: u8,
     prior_position_keys: &[RepetitionKey],
     control: IterationControl<'_>,
+    config: AlphaBetaConfig,
 ) -> (SearchResult, Option<AbortReason>) {
     let mut working = position.clone();
     let mut context = SearchContext {
@@ -392,6 +613,7 @@ fn run_iteration(
         history: prior_position_keys.to_vec(),
         control,
         aborted: None,
+        config,
     };
     context.history.push(position.repetition_key());
     let result = context.negamax(&mut working, depth, -INFINITY, INFINITY, 0);
@@ -418,6 +640,7 @@ struct SearchContext<'a> {
     history: Vec<RepetitionKey>,
     control: IterationControl<'a>,
     aborted: Option<AbortReason>,
+    config: AlphaBetaConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -470,7 +693,10 @@ impl SearchContext<'_> {
     ) -> NodeResult {
         if depth == 0 {
             return NodeResult {
-                score: self.quiescence(position, alpha, beta, ply, 0),
+                score: match self.config.quiescence {
+                    QuiescencePolicy::Enabled => self.quiescence(position, alpha, beta, ply, 0),
+                    QuiescencePolicy::Disabled => self.static_leaf(position, ply),
+                },
                 line: Vec::new(),
             };
         }
@@ -503,7 +729,7 @@ impl SearchContext<'_> {
             };
         }
         let can_claim_draw = position.halfmove_clock() >= 100 || repetitions >= 3;
-        order_moves(&mut moves);
+        self.order_moves(&mut moves);
         let mut best_score = if can_claim_draw { 0 } else { -INFINITY };
         let mut best_line = Vec::new();
         if can_claim_draw {
@@ -615,7 +841,7 @@ impl SearchContext<'_> {
         if !in_check {
             moves.retain(|chess_move| chess_move.is_capture() || chess_move.promotion().is_some());
         }
-        order_moves(&mut moves);
+        self.order_moves(&mut moves);
         for chess_move in moves {
             let undo = position.apply_move_unchecked(chess_move);
             self.history.push(position.repetition_key());
@@ -644,7 +870,7 @@ impl SearchContext<'_> {
         ply: u16,
         can_claim_draw: bool,
     ) -> i32 {
-        order_moves(&mut moves);
+        self.order_moves(&mut moves);
         let mut best_score = if can_claim_draw { 0 } else { -INFINITY };
         alpha = alpha.max(best_score);
         if alpha >= beta {
@@ -707,6 +933,41 @@ impl SearchContext<'_> {
         self.history.iter().filter(|&&key| key == current).count()
     }
 
+    fn static_leaf(&mut self, position: &Position, ply: u16) -> i32 {
+        if !self.visit_node(false) {
+            return 0;
+        }
+        let moves = generate_legal_moves_unchecked(position);
+        if moves.is_empty() {
+            return if is_in_check_unchecked(position, position.side_to_move()) {
+                -MATE_SCORE + i32::from(ply)
+            } else {
+                0
+            };
+        }
+        let repetitions = self.repetition_count(position.repetition_key());
+        if position.halfmove_clock() >= 150
+            || repetitions >= 5
+            || position.has_insufficient_material()
+        {
+            return 0;
+        }
+        let evaluation = self
+            .evaluator
+            .evaluate(position)
+            .centipawns()
+            .clamp(-MAX_STATIC_SCORE, MAX_STATIC_SCORE);
+        if position.halfmove_clock() >= 100 || repetitions >= 3 {
+            evaluation.max(0)
+        } else {
+            evaluation
+        }
+    }
+
+    fn order_moves(&self, moves: &mut [Move]) {
+        order_moves(moves, self.config.move_ordering);
+    }
+
     fn visit_node(&mut self, quiescence: bool) -> bool {
         if self.aborted.is_some() {
             return false;
@@ -739,13 +1000,20 @@ impl SearchContext<'_> {
     }
 }
 
-fn order_moves(moves: &mut [Move]) {
-    moves.sort_by_key(|chess_move| Reverse((move_priority(*chess_move), chess_move.raw())));
+fn order_moves(moves: &mut [Move], policy: MoveOrderingPolicy) {
+    match policy {
+        MoveOrderingPolicy::Tactical => {
+            moves.sort_by_key(|chess_move| Reverse((move_priority(*chess_move), chess_move.raw())));
+        }
+        MoveOrderingPolicy::Encoded => {
+            moves.sort_by_key(|chess_move| Reverse(chess_move.raw()));
+        }
+    }
 }
 
 fn first_legal_move(position: &Position) -> Option<Move> {
     let mut moves = generate_legal_moves_unchecked(position);
-    order_moves(&mut moves);
+    order_moves(&mut moves, MoveOrderingPolicy::Tactical);
     moves.first().copied()
 }
 
@@ -766,7 +1034,8 @@ mod tests {
     use std::{cell::Cell, time::Duration};
 
     use super::{
-        INFINITY, IterationControl, MATE_SCORE, MAX_QUIESCENCE_PLY, MAX_STATIC_SCORE,
+        AlphaBetaConfig, AlphaBetaSearcher, INFINITY, IterationControl, MATE_SCORE,
+        MAX_QUIESCENCE_PLY, MAX_STATIC_SCORE, MoveOrderingPolicy, QuiescencePolicy, SearchBackend,
         SearchContext, SearchError, SearchLimits, SearchResult, SearchTermination, StopToken,
         iterative_search_with_history, search, search_with_history,
     };
@@ -1014,6 +1283,7 @@ mod tests {
             history: vec![position.repetition_key()],
             control: IterationControl::unlimited(),
             aborted: None,
+            config: AlphaBetaConfig::default(),
         };
         let alpha_beta = context.negamax(&mut alpha_beta_position, 2, -INFINITY, INFINITY, 0);
         let mut reference_position = position;
@@ -1167,6 +1437,61 @@ mod tests {
     }
 
     #[test]
+    fn composed_backends_can_ab_test_quiescence_in_one_build() {
+        let position = Position::from_fen("4k3/8/5n2/3p4/8/8/8/3QK3 w - - 0 1").expect("valid FEN");
+        let enabled = AlphaBetaSearcher::new(ClassicalEvaluator, AlphaBetaConfig::default());
+        let disabled = AlphaBetaSearcher::new(
+            ClassicalEvaluator,
+            AlphaBetaConfig {
+                quiescence: QuiescencePolicy::Disabled,
+                move_ordering: MoveOrderingPolicy::Tactical,
+            },
+        );
+
+        let stable = enabled
+            .fixed_search(&position, &[], 1)
+            .expect("search succeeds");
+        let horizon = disabled
+            .fixed_search(&position, &[], 1)
+            .expect("search succeeds");
+
+        assert_ne!(
+            stable.best_move().map(Move::to_uci).as_deref(),
+            Some("d1d5")
+        );
+        assert_eq!(
+            horizon.best_move().map(Move::to_uci).as_deref(),
+            Some("d1d5")
+        );
+        assert!(stable.quiescence_nodes() > 0);
+        assert_eq!(horizon.quiescence_nodes(), 0);
+    }
+
+    #[test]
+    fn move_ordering_policies_preserve_exact_score() {
+        let position = Position::starting();
+        let tactical = AlphaBetaSearcher::new(ClassicalEvaluator, AlphaBetaConfig::default());
+        let encoded = AlphaBetaSearcher::new(
+            ClassicalEvaluator,
+            AlphaBetaConfig {
+                quiescence: QuiescencePolicy::Enabled,
+                move_ordering: MoveOrderingPolicy::Encoded,
+            },
+        );
+
+        let tactical = tactical
+            .fixed_search(&position, &[], 3)
+            .expect("search succeeds");
+        let encoded = encoded
+            .fixed_search(&position, &[], 3)
+            .expect("search succeeds");
+
+        assert_eq!(tactical.score(), encoded.score());
+        assert!(tactical.best_move().is_some());
+        assert!(encoded.best_move().is_some());
+    }
+
+    #[test]
     fn quiescence_stabilizes_a_forced_recapture() {
         let position = Position::from_fen("4k3/8/5n2/3Q4/8/8/8/4K3 b - - 0 1").expect("valid FEN");
         let stand_pat = ClassicalEvaluator.evaluate(&position).centipawns();
@@ -1235,6 +1560,7 @@ mod tests {
             history: vec![position.repetition_key()],
             control: IterationControl::unlimited(),
             aborted: None,
+            config: AlphaBetaConfig::default(),
         };
 
         let score = context.quiescence(
@@ -1285,6 +1611,7 @@ mod tests {
             history: vec![position.repetition_key()],
             control: IterationControl::unlimited(),
             aborted: None,
+            config: AlphaBetaConfig::default(),
         };
 
         context.quiescence(&mut working, -INFINITY, INFINITY, 0, 0);
@@ -1305,6 +1632,7 @@ mod tests {
             history: vec![position.repetition_key()],
             control: IterationControl::unlimited(),
             aborted: None,
+            config: AlphaBetaConfig::default(),
         };
         let alpha = -1_000;
         let beta = 1_000;
@@ -1384,6 +1712,7 @@ mod tests {
             history: vec![position.repetition_key()],
             control: IterationControl::unlimited(),
             aborted: None,
+            config: AlphaBetaConfig::default(),
         };
         let score = context.quiescence(&mut working, -INFINITY, INFINITY, 0, 0);
         assert_eq!(working, *position);
