@@ -1,6 +1,9 @@
 use std::{error::Error, fmt, str::FromStr};
 
-use super::{Bitboard, CastleSide, CastlingRights, Color, Piece, PieceKind, Position, Square};
+use super::{
+    Bitboard, CastleSide, CastlingRights, Color, Piece, PieceKind, Position, RepetitionKey, Square,
+    zobrist,
+};
 
 /// An error produced while parsing a FEN position.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,14 +99,17 @@ impl FromStr for Position {
             return Err(FenError::InvalidFullmoveNumber(fields[5].to_owned()));
         }
 
-        Ok(Self {
+        let mut position = Self {
             pieces,
             side_to_move,
             castling_rights,
             en_passant,
             halfmove_clock,
             fullmove_number,
-        })
+            repetition_key: RepetitionKey::ZERO,
+        };
+        position.repetition_key = zobrist::recompute(&position);
+        Ok(position)
     }
 }
 

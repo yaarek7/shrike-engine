@@ -4,9 +4,9 @@ use std::io::{self, BufRead, Write};
 
 use crate::{
     EngineInfo,
-    chess::{Move, Position},
+    chess::{Move, Position, RepetitionKey},
     eval::ClassicalEvaluator,
-    search::{SearchResult, search},
+    search::{SearchResult, search_with_history},
 };
 
 /// Runs a synchronous UCI session until end-of-input or the `quit` command.
@@ -33,9 +33,18 @@ pub fn run<R: BufRead, W: Write>(reader: &mut R, writer: &mut W) -> io::Result<(
     writer.flush()
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Session {
     position: Position,
+    history: Vec<RepetitionKey>,
+}
+
+impl Default for Session {
+    fn default() -> Self {
+        let position = Position::starting();
+        let history = vec![position.repetition_key()];
+        Self { position, history }
+    }
 }
 
 impl Session {
@@ -90,6 +99,7 @@ impl Session {
             }
             _ => return Err("expected 'startpos' or 'fen'".to_owned()),
         };
+        let mut history = vec![candidate.repetition_key()];
 
         if index < tokens.len() {
             if tokens[index] != "moves" {
@@ -103,9 +113,11 @@ impl Session {
             candidate
                 .make_move(chess_move)
                 .map_err(|error| error.to_string())?;
+            history.push(candidate.repetition_key());
         }
         candidate.validate().map_err(|error| error.to_string())?;
         self.position = candidate;
+        self.history = history;
         Ok(())
     }
 
@@ -117,7 +129,11 @@ impl Session {
                 return writeln!(writer, "bestmove 0000");
             }
         };
-        match search(&self.position, &ClassicalEvaluator, depth) {
+        let prior = self
+            .history
+            .strip_suffix(&[self.position.repetition_key()])
+            .unwrap_or(&self.history);
+        match search_with_history(&self.position, &ClassicalEvaluator, depth, prior) {
             Ok(result) => write_search_result(writer, &result),
             Err(error) => {
                 writeln!(writer, "info string error: {error}")?;
@@ -294,6 +310,31 @@ mod tests {
 
         assert_eq!(returned.len(), 2);
         assert_eq!(returned[0], returned[1]);
+    }
+
+    #[test]
+    fn position_move_history_detects_threefold_repetition() {
+        let position = Position::from_fen("4k3/8/8/8/8/8/7Q/4K3 b - - 0 1").expect("valid FEN");
+        let output = transcript(concat!(
+            "position fen 4k3/8/8/8/8/8/7Q/4K3 b - - 0 1 moves ",
+            "e8f8 e1f1 f8e8 f1e1 ",
+            "e8f8 e1f1 f8e8 f1e1\n",
+            "go depth 3\n",
+            "quit\n"
+        ));
+
+        assert!(output.starts_with("info depth 3 score cp 0 nodes "));
+        assert_legal_bestmove(&output, &position);
+    }
+
+    #[test]
+    fn claimable_fifty_move_draw_still_returns_a_legal_bestmove() {
+        let position = Position::from_fen("4k3/8/8/8/8/8/7Q/4K3 b - - 100 51").expect("valid FEN");
+        let output =
+            transcript("position fen 4k3/8/8/8/8/8/7Q/4K3 b - - 100 51\ngo depth 2\nquit\n");
+
+        assert!(output.starts_with("info depth 2 score cp 0 nodes "));
+        assert_legal_bestmove(&output, &position);
     }
 
     #[test]

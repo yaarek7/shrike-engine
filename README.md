@@ -5,10 +5,10 @@ development process.
 
 ## Status
 
-Milestone M6 is complete: the engine now selects moves with deterministic, fixed-depth negamax
-search, alpha-beta pruning, simple tactical move ordering, mate-distance scores, and principal
-variation reporting. The UCI process accepts `go depth N` and reports score, node count, principal
-variation, and best move.
+Milestone M7 is complete: the engine now has deterministic incremental repetition keys,
+history-aware search, fifty-move handling, and conservative insufficient-material draws in
+addition to the M6 fixed-depth alpha-beta baseline. The UCI position command retains repetition
+history for search.
 
 ## Requirements
 

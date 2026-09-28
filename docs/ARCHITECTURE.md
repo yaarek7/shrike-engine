@@ -14,13 +14,15 @@ The package produces:
 - `chess-engine`, a thin executable that will eventually adapt standard input and output to the
   library's UCI protocol API.
 
-M6 adds deterministic, fixed-depth negamax search with alpha-beta pruning, tactical move ordering,
-mate-distance scores, node counts, and principal variations. M5 provides its replaceable classical
-evaluator, and M4 provides the synchronous, library-testable UCI boundary and functional
-stdin/stdout executable. The `chess` module contains strongly typed domain values, twelve piece
-bitboards, complete FEN position state, strict FEN syntax parsing, two-byte moves, attack detection,
-legal move generation, validated make/unmake, and perft. Protocol, evaluation, and search remain
-outside the chess-rules layer.
+M7 adds deterministic incremental repetition keys and draw-aware search using explicit game
+history, the halfmove clock, and conservative insufficient-material recognition. M6 provides
+fixed-depth negamax search with alpha-beta pruning, tactical move ordering, mate-distance scores,
+node counts, and principal variations. M5 provides its replaceable classical evaluator, and M4
+provides the synchronous, library-testable UCI boundary and functional stdin/stdout executable.
+The `chess` module contains strongly typed domain values, twelve piece bitboards, complete FEN
+position state, strict FEN syntax parsing, two-byte moves, attack detection, legal move generation,
+validated make/unmake, perft, and FIDE-relevant repetition identity. Protocol, evaluation, and
+search remain outside the chess-rules layer.
 
 ## Intended module progression
 
@@ -64,6 +66,8 @@ binary → UCI → search → evaluation
 4. Deterministic execution remains available for tests and experiments.
 5. No unsafe Rust is permitted without a measured need and an accepted ADR.
 6. Hot-path allocations will be measured and controlled once hot paths exist.
+7. Repetition history is explicit search input and remains conceptually separate from future
+   transposition-table identity and storage.
 
 ## Decision records
 

@@ -3,7 +3,7 @@
 use chess_engine::{
     chess::{Move, Position},
     eval::ClassicalEvaluator,
-    search::search,
+    search::{search, search_with_history},
 };
 
 #[test]
@@ -27,6 +27,18 @@ fn public_search_result_is_legal_replayable_and_deterministic() {
     for &chess_move in first.principal_variation() {
         replay.make_move(chess_move).expect("PV move is legal");
     }
+}
+
+#[test]
+fn public_history_aware_search_adjudicates_repetition() {
+    let position = Position::from_fen("4k3/8/8/8/8/8/7Q/4K3 b - - 0 1").expect("valid FEN");
+    let prior = [position.repetition_key(), position.repetition_key()];
+    let result =
+        search_with_history(&position, &ClassicalEvaluator, 2, &prior).expect("search succeeds");
+
+    assert_eq!(result.score().centipawns(), 0);
+    assert!(result.nodes() > 1);
+    assert!(result.best_move().is_some());
 }
 
 #[test]

@@ -3,7 +3,9 @@
 use std::{cmp::Reverse, error::Error, fmt};
 
 use crate::{
-    chess::{Move, Position, PositionError, movegen::generate_legal_moves_unchecked},
+    chess::{
+        Move, Position, PositionError, RepetitionKey, movegen::generate_legal_moves_unchecked,
+    },
     eval::{Evaluator, Score},
 };
 
@@ -54,6 +56,7 @@ pub struct SearchResult {
     depth: u8,
     score: Score,
     nodes: u64,
+    best_move: Option<Move>,
     principal_variation: Vec<Move>,
 }
 
@@ -76,13 +79,18 @@ impl SearchResult {
         self.nodes
     }
 
-    /// Returns the best move, or `None` for checkmate or stalemate.
+    /// Returns a legal root move when one exists.
+    ///
+    /// When a draw claim is the selected option, this is a deterministic
+    /// protocol fallback and the principal variation is empty.
     #[must_use]
-    pub fn best_move(&self) -> Option<Move> {
-        self.principal_variation.first().copied()
+    pub const fn best_move(&self) -> Option<Move> {
+        self.best_move
     }
 
-    /// Returns the principal variation in root-to-leaf order.
+    /// Returns the searched principal variation in root-to-leaf order.
+    ///
+    /// This is empty when a draw claim or automatic draw is selected at the root.
     #[must_use]
     pub fn principal_variation(&self) -> &[Move] {
         &self.principal_variation
@@ -112,6 +120,26 @@ pub fn search(
     evaluator: &dyn Evaluator,
     depth: u8,
 ) -> Result<SearchResult, SearchError> {
+    search_with_history(position, evaluator, depth, &[])
+}
+
+/// Searches a position with keys for positions preceding the root in the game.
+///
+/// `prior_position_keys` must be in chronological order and must not include
+/// `position` itself. Move clocks are read from `position`; the supplied keys
+/// are used only to detect repetition. This keeps repetition history distinct
+/// from any future transposition-table state.
+///
+/// # Errors
+///
+/// Returns [`SearchError::InvalidDepth`] for depth zero or greater than 64,
+/// and [`SearchError::InvalidPosition`] when root validation fails.
+pub fn search_with_history(
+    position: &Position,
+    evaluator: &dyn Evaluator,
+    depth: u8,
+    prior_position_keys: &[RepetitionKey],
+) -> Result<SearchResult, SearchError> {
     if !(1..=MAX_DEPTH).contains(&depth) {
         return Err(SearchError::InvalidDepth(depth));
     }
@@ -121,12 +149,20 @@ pub fn search(
     let mut context = SearchContext {
         evaluator,
         nodes: 0,
+        history: prior_position_keys.to_vec(),
     };
+    context.history.push(position.repetition_key());
     let result = context.negamax(&mut working, depth, -INFINITY, INFINITY, 0);
+    let best_move = result
+        .line
+        .first()
+        .copied()
+        .or_else(|| first_legal_move(position));
     Ok(SearchResult {
         depth,
         score: Score::from_centipawns(result.score),
         nodes: context.nodes,
+        best_move,
         principal_variation: result.line,
     })
 }
@@ -134,6 +170,7 @@ pub fn search(
 struct SearchContext<'a> {
     evaluator: &'a dyn Evaluator,
     nodes: u64,
+    history: Vec<RepetitionKey>,
 }
 
 struct NodeResult {
@@ -166,23 +203,50 @@ impl SearchContext<'_> {
                 line: Vec::new(),
             };
         }
-        if depth == 0 {
+        let repetitions = self.repetition_count(position.repetition_key());
+        if position.halfmove_clock() >= 150
+            || repetitions >= 5
+            || position.has_insufficient_material()
+        {
             return NodeResult {
-                score: self
-                    .evaluator
-                    .evaluate(position)
-                    .centipawns()
-                    .clamp(-MAX_STATIC_SCORE, MAX_STATIC_SCORE),
+                score: 0,
+                line: Vec::new(),
+            };
+        }
+        let can_claim_draw = position.halfmove_clock() >= 100 || repetitions >= 3;
+        if depth == 0 {
+            let evaluation = self
+                .evaluator
+                .evaluate(position)
+                .centipawns()
+                .clamp(-MAX_STATIC_SCORE, MAX_STATIC_SCORE);
+            return NodeResult {
+                score: if can_claim_draw {
+                    evaluation.max(0)
+                } else {
+                    evaluation
+                },
                 line: Vec::new(),
             };
         }
 
-        moves.sort_by_key(|chess_move| Reverse((move_priority(*chess_move), chess_move.raw())));
-        let mut best_score = -INFINITY;
+        order_moves(&mut moves);
+        let mut best_score = if can_claim_draw { 0 } else { -INFINITY };
         let mut best_line = Vec::new();
+        if can_claim_draw {
+            alpha = alpha.max(0);
+            if alpha >= beta {
+                return NodeResult {
+                    score: best_score,
+                    line: best_line,
+                };
+            }
+        }
         for chess_move in moves {
             let undo = position.apply_move_unchecked(chess_move);
+            self.history.push(position.repetition_key());
             let child = self.negamax(position, depth - 1, -beta, -alpha, ply + 1);
+            self.history.pop();
             let score = -child.score;
             position.unmake_move(undo);
 
@@ -202,6 +266,20 @@ impl SearchContext<'_> {
             line: best_line,
         }
     }
+
+    fn repetition_count(&self, current: RepetitionKey) -> usize {
+        self.history.iter().filter(|&&key| key == current).count()
+    }
+}
+
+fn order_moves(moves: &mut [Move]) {
+    moves.sort_by_key(|chess_move| Reverse((move_priority(*chess_move), chess_move.raw())));
+}
+
+fn first_legal_move(position: &Position) -> Option<Move> {
+    let mut moves = generate_legal_moves_unchecked(position);
+    order_moves(&mut moves);
+    moves.first().copied()
 }
 
 fn move_priority(chess_move: Move) -> i32 {
@@ -218,7 +296,10 @@ fn move_priority(chess_move: Move) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{INFINITY, MATE_SCORE, MAX_STATIC_SCORE, SearchContext, SearchError, search};
+    use super::{
+        INFINITY, MATE_SCORE, MAX_STATIC_SCORE, SearchContext, SearchError, search,
+        search_with_history,
+    };
     use crate::{
         chess::{Move, Position, movegen::generate_legal_moves_unchecked},
         eval::{ClassicalEvaluator, Evaluator, Score},
@@ -303,6 +384,7 @@ mod tests {
         let mut context = SearchContext {
             evaluator: &ClassicalEvaluator,
             nodes: 0,
+            history: vec![position.repetition_key()],
         };
         let alpha_beta = context.negamax(&mut alpha_beta_position, 3, -INFINITY, INFINITY, 0);
         let mut reference_position = position;
@@ -334,6 +416,106 @@ mod tests {
         for &chess_move in first.principal_variation() {
             replay.make_move(chess_move).expect("PV move is legal");
         }
+    }
+
+    #[test]
+    fn losing_side_can_claim_third_occurrence_with_a_legal_bestmove() {
+        let position = Position::from_fen("4k3/8/8/8/8/8/7Q/4K3 b - - 0 1").expect("valid FEN");
+        let prior = [position.repetition_key(), position.repetition_key()];
+        let result = search_with_history(&position, &ClassicalEvaluator, 3, &prior)
+            .expect("search succeeds");
+
+        assert_eq!(result.score(), Score::ZERO);
+        assert!(result.nodes() > 1);
+        assert!(result.best_move().is_some());
+        assert!(result.principal_variation().is_empty());
+    }
+
+    #[test]
+    fn second_occurrence_is_not_adjudicated_as_threefold() {
+        let position = Position::starting();
+        let prior = [position.repetition_key()];
+        let result = search_with_history(&position, &ClassicalEvaluator, 1, &prior)
+            .expect("search succeeds");
+
+        assert!(result.nodes() > 1);
+        assert!(result.best_move().is_some());
+    }
+
+    #[test]
+    fn losing_side_can_claim_fifty_move_draw_with_a_legal_bestmove() {
+        let position = Position::from_fen("4k3/8/8/8/8/8/7Q/4K3 b - - 100 51").expect("valid FEN");
+        let result = search(&position, &ClassicalEvaluator, 3).expect("search succeeds");
+
+        assert_eq!(result.score(), Score::ZERO);
+        assert!(result.nodes() > 1);
+        assert!(result.best_move().is_some());
+        assert!(result.principal_variation().is_empty());
+    }
+
+    #[test]
+    fn winning_continuation_outranks_each_claimable_draw() {
+        let fifty_move =
+            Position::from_fen("7k/5Q2/6K1/8/8/8/8/8 w - - 100 51").expect("valid FEN");
+        let fifty_result = search(&fifty_move, &ClassicalEvaluator, 1).expect("search succeeds");
+        let repetition_position =
+            Position::from_fen("7k/5Q2/6K1/8/8/8/8/8 w - - 0 1").expect("valid FEN");
+        let prior = [
+            repetition_position.repetition_key(),
+            repetition_position.repetition_key(),
+        ];
+        let repetition_result =
+            search_with_history(&repetition_position, &ClassicalEvaluator, 1, &prior)
+                .expect("search succeeds");
+
+        for result in [fifty_result, repetition_result] {
+            assert_eq!(result.mate_in(), Some(1));
+            assert_eq!(
+                result.best_move().map(Move::to_uci).as_deref(),
+                Some("f7f8")
+            );
+        }
+    }
+
+    #[test]
+    fn automatic_draws_are_distinct_from_claimable_draws() {
+        let seventy_five =
+            Position::from_fen("4k3/8/8/8/8/8/7Q/4K3 b - - 150 76").expect("valid FEN");
+        let seventy_five_result =
+            search(&seventy_five, &ClassicalEvaluator, 3).expect("search succeeds");
+        let fivefold = Position::from_fen("4k3/8/8/8/8/8/7Q/4K3 b - - 0 1").expect("valid FEN");
+        let prior = [fivefold.repetition_key(); 4];
+        let fivefold_result = search_with_history(&fivefold, &ClassicalEvaluator, 3, &prior)
+            .expect("search succeeds");
+
+        for result in [seventy_five_result, fivefold_result] {
+            assert_eq!(result.score(), Score::ZERO);
+            assert_eq!(result.nodes(), 1);
+            assert!(result.best_move().is_some());
+            assert!(result.principal_variation().is_empty());
+        }
+    }
+
+    #[test]
+    fn insufficient_material_is_an_automatic_draw() {
+        let position = Position::from_fen("4k3/8/8/8/8/8/8/2B1K3 w - - 0 1").expect("valid FEN");
+        let result = search(&position, &ClassicalEvaluator, 3).expect("search succeeds");
+
+        assert_eq!(result.score(), Score::ZERO);
+        assert_eq!(result.nodes(), 1);
+        assert!(result.best_move().is_some());
+        assert!(result.principal_variation().is_empty());
+    }
+
+    #[test]
+    fn checkmate_precedes_draw_adjudication() {
+        let position = Position::from_fen("7k/6Q1/6K1/8/8/8/8/8 b - - 100 51").expect("valid FEN");
+        let prior = [position.repetition_key(), position.repetition_key()];
+        let result = search_with_history(&position, &ClassicalEvaluator, 3, &prior)
+            .expect("search succeeds");
+
+        assert_eq!(result.mate_in(), Some(0));
+        assert_ne!(result.score(), Score::ZERO);
     }
 
     #[test]

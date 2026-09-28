@@ -465,7 +465,7 @@ const fn home_rank(color: Color) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{MoveError, PositionError};
-    use crate::chess::{Move, MoveKind, Position, Square};
+    use crate::chess::{Move, MoveKind, Position, Square, zobrist};
 
     fn move_by_uci(position: &Position, uci: &str) -> Move {
         position
@@ -498,6 +498,34 @@ mod tests {
         );
         position.unmake_move(undo);
         assert_eq!(position, original);
+    }
+
+    #[test]
+    fn incremental_repetition_keys_match_full_recomputation() {
+        for fen in [
+            Position::STARTING_FEN,
+            "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1",
+            "7k/8/8/3pP3/4K3/8/8/8 w - d6 0 1",
+            "r3k3/1P6/8/8/8/8/8/4K3 w - - 0 1",
+        ] {
+            let position = Position::from_fen(fen).expect("valid FEN");
+            for chess_move in position.legal_moves().expect("valid position") {
+                let mut child = position.clone();
+                let original_key = child.repetition_key();
+                let undo = child
+                    .make_move(chess_move)
+                    .expect("generated move is legal");
+
+                assert_eq!(
+                    child.repetition_key(),
+                    zobrist::recompute(&child),
+                    "incremental key mismatch after {chess_move} from {fen}"
+                );
+                child.unmake_move(undo);
+                assert_eq!(child.repetition_key(), original_key);
+                assert_eq!(child, position);
+            }
+        }
     }
 
     #[test]

@@ -8,6 +8,7 @@ mod moves;
 mod perft;
 mod position;
 mod types;
+mod zobrist;
 
 pub use bitboard::Bitboard;
 pub use fen::FenError;
@@ -16,3 +17,4 @@ pub use moves::{Move, MoveKind};
 pub use perft::perft;
 pub use position::{Position, Undo};
 pub use types::{CastleSide, CastlingRights, Color, Piece, PieceKind, Square, SquareParseError};
+pub use zobrist::RepetitionKey;

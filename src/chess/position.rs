@@ -1,5 +1,6 @@
 use super::{
-    Bitboard, CastleSide, CastlingRights, Color, FenError, Move, MoveKind, Piece, PieceKind, Square,
+    Bitboard, CastleSide, CastlingRights, Color, FenError, Move, MoveKind, Piece, PieceKind,
+    RepetitionKey, Square, zobrist,
 };
 
 /// State required to restore a position after making a move.
@@ -22,6 +23,7 @@ pub struct Position {
     pub(super) en_passant: Option<Square>,
     pub(super) halfmove_clock: u32,
     pub(super) fullmove_number: u32,
+    pub(super) repetition_key: RepetitionKey,
 }
 
 impl Position {
@@ -89,6 +91,49 @@ impl Position {
         self.fullmove_number
     }
 
+    /// Returns the deterministic key used to compare positions for repetition.
+    ///
+    /// This excludes move clocks and includes an en-passant file only when a
+    /// legal en-passant capture exists. It is not a transposition-table key.
+    #[must_use]
+    pub const fn repetition_key(&self) -> RepetitionKey {
+        self.repetition_key
+    }
+
+    /// Conservatively identifies common positions where checkmate is impossible.
+    ///
+    /// This recognizes king versus king, king and a single bishop or knight
+    /// versus king, and bishops-only positions where every bishop occupies the
+    /// same square color. It is intentionally not a complete FIDE dead-position
+    /// detector.
+    #[must_use]
+    pub fn has_insufficient_material(&self) -> bool {
+        for color in Color::ALL {
+            if self.bitboard(color, PieceKind::Pawn).bits() != 0
+                || self.bitboard(color, PieceKind::Rook).bits() != 0
+                || self.bitboard(color, PieceKind::Queen).bits() != 0
+            {
+                return false;
+            }
+        }
+
+        let knights = self.bitboard(Color::White, PieceKind::Knight).count()
+            + self.bitboard(Color::Black, PieceKind::Knight).count();
+        let bishops = self.bitboard(Color::White, PieceKind::Bishop).count()
+            + self.bitboard(Color::Black, PieceKind::Bishop).count();
+        if bishops == 0 {
+            return knights <= 1;
+        }
+        if knights != 0 {
+            return false;
+        }
+
+        let all_bishops = self.bitboard(Color::White, PieceKind::Bishop).bits()
+            | self.bitboard(Color::Black, PieceKind::Bishop).bits();
+        let light_squares = 0x55AA_55AA_55AA_55AA_u64;
+        all_bishops & light_squares == 0 || all_bishops & !light_squares == 0
+    }
+
     /// Returns the pieces matching `color` and `kind`.
     #[must_use]
     pub const fn bitboard(&self, color: Color, kind: PieceKind) -> Bitboard {
@@ -136,11 +181,19 @@ impl Position {
         let undo = Undo {
             previous: self.clone(),
         };
+        if let Some(file) = zobrist::legal_en_passant_file(self) {
+            self.repetition_key.toggle(zobrist::en_passant_key(file));
+        }
         let from = chess_move.from();
         let to = chess_move.to();
         let moving_piece = self
             .piece_at(from)
             .expect("generated moves always have a source piece");
+        self.repetition_key.toggle(zobrist::piece_key(
+            moving_piece.color,
+            moving_piece.kind,
+            from,
+        ));
         let captured_piece = if chess_move.kind() == MoveKind::EnPassant {
             let captured_rank = match moving_piece.color {
                 Color::White => to.rank() - 1,
@@ -151,12 +204,19 @@ impl Position {
             let piece = self.piece_at(captured_square);
             if let Some(piece) = piece {
                 self.remove_piece(piece, captured_square);
+                self.repetition_key.toggle(zobrist::piece_key(
+                    piece.color,
+                    piece.kind,
+                    captured_square,
+                ));
             }
             piece.map(|piece| (piece, captured_square))
         } else {
             let piece = self.piece_at(to);
             if let Some(piece) = piece {
                 self.remove_piece(piece, to);
+                self.repetition_key
+                    .toggle(zobrist::piece_key(piece.color, piece.kind, to));
             }
             piece.map(|piece| (piece, to))
         };
@@ -171,8 +231,20 @@ impl Position {
 
         let placed_kind = chess_move.promotion().unwrap_or(moving_piece.kind);
         self.insert_piece(Piece::new(moving_piece.color, placed_kind), to);
+        self.repetition_key
+            .toggle(zobrist::piece_key(moving_piece.color, placed_kind, to));
 
+        let previous_castling = self.castling_rights;
         self.update_castling_rights(moving_piece, from, captured_piece);
+        for color in Color::ALL {
+            for side in [CastleSide::KingSide, CastleSide::QueenSide] {
+                if previous_castling.allows(color, side) != self.castling_rights.allows(color, side)
+                {
+                    self.repetition_key
+                        .toggle(zobrist::castling_key(color, side));
+                }
+            }
+        }
         self.en_passant = if chess_move.kind() == MoveKind::DoublePawnPush {
             let passed_rank = match moving_piece.color {
                 Color::White => from.rank() + 1,
@@ -191,6 +263,11 @@ impl Position {
             self.fullmove_number = self.fullmove_number.saturating_add(1);
         }
         self.side_to_move = self.side_to_move.opposite();
+        self.repetition_key.toggle(zobrist::side_key());
+        if let Some(file) = zobrist::legal_en_passant_file(self) {
+            self.repetition_key.toggle(zobrist::en_passant_key(file));
+        }
+        debug_assert_eq!(self.repetition_key, zobrist::recompute(self));
         undo
     }
 
@@ -222,6 +299,10 @@ impl Position {
         let rook = Piece::new(color, PieceKind::Rook);
         self.remove_piece(rook, from);
         self.insert_piece(rook, to);
+        self.repetition_key
+            .toggle(zobrist::piece_key(color, PieceKind::Rook, from));
+        self.repetition_key
+            .toggle(zobrist::piece_key(color, PieceKind::Rook, to));
     }
 
     fn update_castling_rights(
@@ -258,5 +339,40 @@ impl Position {
 impl Default for Position {
     fn default() -> Self {
         Self::starting()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Position;
+
+    #[test]
+    fn conservative_insufficient_material_cases_are_recognized() {
+        for fen in [
+            "4k3/8/8/8/8/8/8/4K3 w - - 0 1",
+            "4k3/8/8/8/8/8/8/2B1K3 w - - 0 1",
+            "4k3/8/8/8/8/8/8/2N1K3 w - - 0 1",
+            "4kb2/8/8/8/8/8/8/2B1K3 w - - 0 1",
+            "4k3/8/8/6b1/8/4B3/8/4K3 w - - 0 1",
+        ] {
+            let position = Position::from_fen(fen).expect("valid FEN");
+            assert!(position.has_insufficient_material(), "expected draw: {fen}");
+        }
+    }
+
+    #[test]
+    fn potentially_mating_material_is_not_declared_insufficient() {
+        for fen in [
+            "4k3/8/8/8/8/8/8/R3K3 w - - 0 1",
+            "4k3/8/8/8/8/8/8/2NNK3 w - - 0 1",
+            "4k3/8/8/8/8/8/8/2BNK3 w - - 0 1",
+            "2b1k3/8/8/8/8/8/8/2B1K3 w - - 0 1",
+        ] {
+            let position = Position::from_fen(fen).expect("valid FEN");
+            assert!(
+                !position.has_insufficient_material(),
+                "must remain searchable: {fen}"
+            );
+        }
     }
 }
