@@ -3,7 +3,7 @@
 mod attacks;
 mod bitboard;
 mod fen;
-mod movegen;
+pub(crate) mod movegen;
 mod moves;
 mod perft;
 mod position;

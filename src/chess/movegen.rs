@@ -128,7 +128,7 @@ impl Position {
     }
 }
 
-pub(super) fn generate_legal_moves_unchecked(position: &Position) -> Vec<Move> {
+pub(crate) fn generate_legal_moves_unchecked(position: &Position) -> Vec<Move> {
     let moving_color = position.side_to_move();
     let mut working = position.clone();
     generate_pseudo_legal_moves(position)

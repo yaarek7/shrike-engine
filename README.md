@@ -5,9 +5,10 @@ development process.
 
 ## Status
 
-Milestone M5 is complete: the engine adds a replaceable classical evaluator with centipawn material,
-piece activity, mobility, pawn structure, and king safety components. The UCI process remains
-functional, while move choice remains deterministic until search arrives.
+Milestone M6 is complete: the engine now selects moves with deterministic, fixed-depth negamax
+search, alpha-beta pruning, simple tactical move ordering, mate-distance scores, and principal
+variation reporting. The UCI process accepts `go depth N` and reports score, node count, principal
+variation, and best move.
 
 ## Requirements
 

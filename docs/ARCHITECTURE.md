@@ -14,12 +14,13 @@ The package produces:
 - `chess-engine`, a thin executable that will eventually adapt standard input and output to the
   library's UCI protocol API.
 
-M5 adds a modular classical evaluator with independently observable score components.
-M4 provides a synchronous, library-testable UCI boundary and a functional stdin/stdout executable.
-The `chess` module contains strongly typed domain
-values, twelve piece bitboards, complete FEN position state, strict FEN syntax parsing, two-byte
-moves, attack detection, legal move generation, validated make/unmake, and perft. Protocol,
-evaluation, and search remain outside the chess-rules layer; search is not yet implemented.
+M6 adds deterministic, fixed-depth negamax search with alpha-beta pruning, tactical move ordering,
+mate-distance scores, node counts, and principal variations. M5 provides its replaceable classical
+evaluator, and M4 provides the synchronous, library-testable UCI boundary and functional
+stdin/stdout executable. The `chess` module contains strongly typed domain values, twelve piece
+bitboards, complete FEN position state, strict FEN syntax parsing, two-byte moves, attack detection,
+legal move generation, validated make/unmake, and perft. Protocol, evaluation, and search remain
+outside the chess-rules layer.
 
 ## Intended module progression
 
@@ -32,7 +33,7 @@ src/
 ├── chess/       # Position, FEN, moves, attacks, legal generation, and perft
 ├── uci/         # Synchronous protocol parsing and session state
 ├── eval/        # Classical baseline behind a replaceable evaluator trait
-├── search/      # Search, ordering, time management, transposition table
+├── search/      # Fixed-depth negamax, alpha-beta pruning, and move ordering
 └── engine.rs    # Coordination without protocol-specific I/O
 ```
 
@@ -50,9 +51,9 @@ The protocol layer may depend on the engine API. The engine may depend on chess,
 and search abstractions. Core chess representation must not depend on UCI, evaluation, or search.
 
 ```text
-binary → UCI → engine → search → evaluation
-                         ↓
-                       chess
+binary → UCI → search → evaluation
+          ↓       ↓
+        chess ←─────┘
 ```
 
 ## Invariants

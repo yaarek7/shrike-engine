@@ -5,6 +5,8 @@ use std::io::{self, BufRead, Write};
 use crate::{
     EngineInfo,
     chess::{Move, Position},
+    eval::ClassicalEvaluator,
+    search::{SearchResult, search},
 };
 
 /// Runs a synchronous UCI session until end-of-input or the `quit` command.
@@ -52,10 +54,13 @@ impl Session {
                     writeln!(writer, "info string error: {error}")?;
                 }
             }
-            "go" => self.go(writer)?,
+            "go" => {
+                let remaining: Vec<_> = tokens.collect();
+                self.go(&remaining, writer)?;
+            }
             "quit" => return Ok(false),
             // `ucinewgame` and `stop` have no stateful work in the synchronous
-            // M4 engine. Unknown commands are ignored for forward compatibility.
+            // fixed-depth engine. Unknown commands are ignored for forward compatibility.
             _ => {}
         }
         Ok(true)
@@ -104,16 +109,58 @@ impl Session {
         Ok(())
     }
 
-    fn go<W: Write>(&self, writer: &mut W) -> io::Result<()> {
-        let best_move = self
-            .position
-            .legal_moves()
-            .ok()
-            .and_then(|moves| moves.into_iter().next());
-        match best_move {
-            Some(chess_move) => writeln!(writer, "bestmove {chess_move}"),
-            None => writeln!(writer, "bestmove 0000"),
+    fn go<W: Write>(&self, tokens: &[&str], writer: &mut W) -> io::Result<()> {
+        let depth = match parse_depth(tokens) {
+            Ok(depth) => depth,
+            Err(error) => {
+                writeln!(writer, "info string error: {error}")?;
+                return writeln!(writer, "bestmove 0000");
+            }
+        };
+        match search(&self.position, &ClassicalEvaluator, depth) {
+            Ok(result) => write_search_result(writer, &result),
+            Err(error) => {
+                writeln!(writer, "info string error: {error}")?;
+                writeln!(writer, "bestmove 0000")
+            }
         }
+    }
+}
+
+fn parse_depth(tokens: &[&str]) -> Result<u8, String> {
+    let Some(index) = tokens.iter().position(|&token| token == "depth") else {
+        return Ok(1);
+    };
+    let value = tokens
+        .get(index + 1)
+        .ok_or_else(|| "go depth requires a value".to_owned())?;
+    let depth = value
+        .parse::<u8>()
+        .map_err(|_| format!("invalid search depth '{value}'"))?;
+    if !(1..=64).contains(&depth) {
+        return Err(format!("search depth {depth} is outside 1..=64"));
+    }
+    Ok(depth)
+}
+
+fn write_search_result<W: Write>(writer: &mut W, result: &SearchResult) -> io::Result<()> {
+    write!(writer, "info depth {} score ", result.depth())?;
+    if let Some(moves) = result.mate_in() {
+        write!(writer, "mate {moves}")?;
+    } else {
+        write!(writer, "cp {}", result.score().centipawns())?;
+    }
+    write!(writer, " nodes {}", result.nodes())?;
+    if !result.principal_variation().is_empty() {
+        write!(writer, " pv")?;
+        for chess_move in result.principal_variation() {
+            write!(writer, " {chess_move}")?;
+        }
+    }
+    writeln!(writer)?;
+    match result.best_move() {
+        Some(chess_move) => writeln!(writer, "bestmove {chess_move}"),
+        None => writeln!(writer, "bestmove 0000"),
     }
 }
 
@@ -194,7 +241,8 @@ mod tests {
     fn fen_checkmate_returns_null_bestmove() {
         let output = transcript("position fen 7k/6Q1/6K1/8/8/8/8/8 b - - 0 1\ngo depth 1\n");
 
-        assert_eq!(output, "bestmove 0000\n");
+        assert!(output.starts_with("info depth 1 score mate 0 nodes 1\n"));
+        assert!(output.ends_with("bestmove 0000\n"));
     }
 
     #[test]
@@ -252,7 +300,8 @@ mod tests {
     fn stalemate_returns_null_bestmove() {
         let output = transcript("position fen 7k/5Q2/6K1/8/8/8/8/8 b - - 0 1\ngo\nquit\n");
 
-        assert_eq!(output, "bestmove 0000\n");
+        assert!(output.starts_with("info depth 1 score cp 0 nodes 1\n"));
+        assert!(output.ends_with("bestmove 0000\n"));
     }
 
     #[test]
@@ -269,5 +318,29 @@ mod tests {
         let output = transcript("\r\nunknown future command\r\nisready\r\nquit\r\nisready\r\n");
 
         assert_eq!(output, "readyok\n");
+    }
+
+    #[test]
+    fn go_reports_requested_depth_score_nodes_and_pv() {
+        let output = transcript("position fen 4k3/8/8/8/8/8/q7/R3K3 w - - 0 1\ngo depth 2\nquit\n");
+
+        assert!(output.starts_with("info depth 2 score cp "));
+        assert!(output.contains(" nodes "));
+        assert!(output.contains(" pv a1a2 "));
+        assert!(output.ends_with("bestmove a1a2\n"));
+    }
+
+    #[test]
+    fn malformed_depth_completes_with_null_move() {
+        let output = transcript("go depth nope\nisready\nquit\n");
+
+        assert_eq!(
+            output,
+            concat!(
+                "info string error: invalid search depth 'nope'\n",
+                "bestmove 0000\n",
+                "readyok\n"
+            )
+        );
     }
 }

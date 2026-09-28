@@ -132,7 +132,7 @@ impl Position {
         self.castling_rights.allows(color, side)
     }
 
-    pub(super) fn apply_move_unchecked(&mut self, chess_move: Move) -> Undo {
+    pub(crate) fn apply_move_unchecked(&mut self, chess_move: Move) -> Undo {
         let undo = Undo {
             previous: self.clone(),
         };
