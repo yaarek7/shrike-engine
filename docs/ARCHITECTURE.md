@@ -14,9 +14,10 @@ The package produces:
 - `chess-engine`, a thin executable that will eventually adapt standard input and output to the
   library's UCI protocol API.
 
-M1 adds the foundational `chess` module: strongly typed domain values, twelve piece bitboards,
-complete FEN position state, and strict FEN syntax parsing. It intentionally does not yet include
-move representation, attack detection, position mutation, or move generation.
+M2 adds a compact, semantic move value to the foundational `chess` module. The module now contains
+strongly typed domain values, twelve piece bitboards, complete FEN position state, strict FEN
+syntax parsing, and two-byte moves. It intentionally does not yet include attack detection,
+position mutation, or move generation.
 
 ## Intended module progression
 

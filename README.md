@@ -5,9 +5,9 @@ development process.
 
 ## Status
 
-Milestone M1 is complete: the project has a bitboard-backed position representation, strongly
-typed chess-domain values, and strict FEN parsing and serialization. Move representation and
-generation intentionally begin in later milestones.
+Milestone M2 is complete: the project has a bitboard-backed position representation, strongly
+typed chess-domain values, strict FEN handling, and a two-byte move representation covering
+captures, castling, en passant, and promotions. Move generation begins in the next milestone.
 
 ## Requirements
 
