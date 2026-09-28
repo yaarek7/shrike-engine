@@ -131,6 +131,21 @@ impl CastlingRights {
         };
         self.0 |= mask;
     }
+
+    pub(super) fn revoke(&mut self, color: Color, side: CastleSide) {
+        let mask = match (color, side) {
+            (Color::White, CastleSide::KingSide) => Self::WHITE_KINGSIDE,
+            (Color::White, CastleSide::QueenSide) => Self::WHITE_QUEENSIDE,
+            (Color::Black, CastleSide::KingSide) => Self::BLACK_KINGSIDE,
+            (Color::Black, CastleSide::QueenSide) => Self::BLACK_QUEENSIDE,
+        };
+        self.0 &= !mask;
+    }
+
+    pub(super) fn revoke_all(&mut self, color: Color) {
+        self.revoke(color, CastleSide::KingSide);
+        self.revoke(color, CastleSide::QueenSide);
+    }
 }
 
 /// A square on a chessboard.

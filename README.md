@@ -5,9 +5,9 @@ development process.
 
 ## Status
 
-Milestone M2 is complete: the project has a bitboard-backed position representation, strongly
-typed chess-domain values, strict FEN handling, and a two-byte move representation covering
-captures, castling, en passant, and promotions. Move generation begins in the next milestone.
+Milestone M3 is complete: the engine has validated orthodox positions, attack detection, complete
+legal move generation, exact make/unmake, and a canonical perft regression suite. UCI protocol
+support begins in the next milestone.
 
 ## Requirements
 

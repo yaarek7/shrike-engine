@@ -33,6 +33,14 @@ cargo build --release --locked
 
 CI runs all five checks. The lockfile is part of the application build and should remain current.
 
+Move-generation changes must additionally run the routine release-mode perft suite. Before a
+move-generation milestone or release, run the retained deep suite:
+
+```sh
+cargo test --release --test perft --locked -- --nocapture
+cargo test --release --test perft --locked -- --ignored --nocapture
+```
+
 ## Testing layers
 
 - Unit tests belong beside small implementation units.

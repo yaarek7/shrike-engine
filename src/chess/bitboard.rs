@@ -40,8 +40,32 @@ impl Bitboard {
         self.0.count_ones()
     }
 
+    /// Iterates over contained squares from least to most significant bit.
+    pub fn squares(self) -> impl Iterator<Item = Square> {
+        BitboardIter(self.0)
+    }
+
     pub(super) fn insert(&mut self, square: Square) {
         self.0 |= Self::from_square(square).0;
+    }
+
+    pub(super) fn remove(&mut self, square: Square) {
+        self.0 &= !Self::from_square(square).0;
+    }
+}
+
+struct BitboardIter(u64);
+
+impl Iterator for BitboardIter {
+    type Item = Square;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.0 == 0 {
+            return None;
+        }
+        let index = self.0.trailing_zeros();
+        self.0 &= self.0 - 1;
+        Square::from_index(u8::try_from(index).expect("a u64 bit index fits in u8"))
     }
 }
 
@@ -57,5 +81,13 @@ mod tests {
 
         assert_eq!(Bitboard::from_square(a1).bits(), 1);
         assert_eq!(Bitboard::from_square(h8).bits(), 1_u64 << 63);
+    }
+
+    #[test]
+    fn square_iteration_is_complete_and_ordered() {
+        let board = Bitboard::from_bits((1_u64 << 63) | (1_u64 << 7) | 1);
+        let indices: Vec<_> = board.squares().map(Square::index).collect();
+
+        assert_eq!(indices, vec![0, 7, 63]);
     }
 }
