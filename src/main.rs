@@ -6,9 +6,8 @@ use std::{io, process::ExitCode};
 
 fn main() -> ExitCode {
     let stdin = io::stdin();
-    let stdout = io::stdout();
     let mut reader = stdin.lock();
-    let mut writer = io::BufWriter::new(stdout.lock());
+    let mut writer = io::BufWriter::new(io::stdout());
 
     match chess_engine::uci::run(&mut reader, &mut writer) {
         Ok(()) => ExitCode::SUCCESS,

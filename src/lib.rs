@@ -10,7 +10,7 @@
 pub mod chess;
 /// Position evaluation implementations and score types.
 pub mod eval;
-/// Fixed-depth game-tree search.
+/// Fixed-depth and iterative, resource-limited game-tree search.
 pub mod search;
 /// Universal Chess Interface protocol support.
 pub mod uci;

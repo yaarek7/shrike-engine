@@ -1,15 +1,20 @@
 //! Universal Chess Interface (UCI) protocol session handling.
 
-use std::io::{self, BufRead, Write};
+use std::{
+    io::{self, BufRead, Write},
+    sync::{Arc, Mutex},
+    thread,
+    time::Duration,
+};
 
 use crate::{
     EngineInfo,
-    chess::{Move, Position, RepetitionKey},
+    chess::{Color, Move, Position, RepetitionKey},
     eval::ClassicalEvaluator,
-    search::{SearchResult, search_with_history},
+    search::{IterationInfo, SearchLimits, StopToken, iterative_search_with_history},
 };
 
-/// Runs a synchronous UCI session until end-of-input or the `quit` command.
+/// Runs a UCI session until end-of-input or the `quit` command.
 ///
 /// Protocol state is kept entirely within this function, making sessions
 /// deterministic and independently testable without spawning the executable.
@@ -17,20 +22,82 @@ use crate::{
 /// # Errors
 ///
 /// Returns an I/O error if reading a command or writing a response fails.
-pub fn run<R: BufRead, W: Write>(reader: &mut R, writer: &mut W) -> io::Result<()> {
-    let mut session = Session::default();
-    let mut input = String::new();
-    loop {
-        input.clear();
-        if reader.read_line(&mut input)? == 0 {
-            break;
+pub fn run<R: BufRead, W: Write + Send>(reader: &mut R, writer: &mut W) -> io::Result<()> {
+    thread::scope(|scope| {
+        let output = Arc::new(Mutex::new(writer));
+        let mut session = Session::default();
+        let mut active: Option<(StopToken, thread::ScopedJoinHandle<'_, io::Result<()>>)> = None;
+        let mut input = String::new();
+
+        loop {
+            if active
+                .as_ref()
+                .is_some_and(|(_, handle)| handle.is_finished())
+            {
+                if let Some(task) = active.take() {
+                    join_search(task)?;
+                }
+            }
+            input.clear();
+            if reader.read_line(&mut input)? == 0 {
+                if let Some(task) = active.take() {
+                    task.0.stop();
+                    join_search(task)?;
+                }
+                break;
+            }
+            let mut tokens = input.split_whitespace();
+            let Some(command) = tokens.next() else {
+                continue;
+            };
+            let remaining: Vec<_> = tokens.collect();
+            match command {
+                "uci" => with_output(&output, Session::identify)?,
+                "isready" => with_output(&output, |writer| writeln!(writer, "readyok"))?,
+                "position" => {
+                    stop_and_join(&mut active)?;
+                    if let Err(error) = session.set_position(&remaining) {
+                        with_output(&output, |writer| {
+                            writeln!(writer, "info string error: {error}")
+                        })?;
+                    }
+                }
+                "go" => {
+                    stop_and_join(&mut active)?;
+                    match parse_go(&remaining, session.position.side_to_move()) {
+                        Ok(limits) => {
+                            let position = session.position.clone();
+                            let prior = session.prior_history().to_vec();
+                            let stop = StopToken::default();
+                            let worker_stop = stop.clone();
+                            let worker_output = Arc::clone(&output);
+                            let handle = scope.spawn(move || {
+                                run_search_worker(
+                                    &position,
+                                    &prior,
+                                    limits,
+                                    &worker_stop,
+                                    &worker_output,
+                                )
+                            });
+                            active = Some((stop, handle));
+                        }
+                        Err(error) => with_output(&output, |writer| {
+                            writeln!(writer, "info string error: {error}")?;
+                            writeln!(writer, "bestmove 0000")
+                        })?,
+                    }
+                }
+                "stop" | "ucinewgame" => stop_and_join(&mut active)?,
+                "quit" => {
+                    stop_and_join(&mut active)?;
+                    break;
+                }
+                _ => {}
+            }
         }
-        if !session.handle(input.trim(), writer)? {
-            break;
-        }
-        writer.flush()?;
-    }
-    writer.flush()
+        with_output(&output, Write::flush)
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,33 +115,6 @@ impl Default for Session {
 }
 
 impl Session {
-    fn handle<W: Write>(&mut self, line: &str, writer: &mut W) -> io::Result<bool> {
-        let mut tokens = line.split_whitespace();
-        let Some(command) = tokens.next() else {
-            return Ok(true);
-        };
-
-        match command {
-            "uci" => Self::identify(writer)?,
-            "isready" => writeln!(writer, "readyok")?,
-            "position" => {
-                let remaining: Vec<_> = tokens.collect();
-                if let Err(error) = self.set_position(&remaining) {
-                    writeln!(writer, "info string error: {error}")?;
-                }
-            }
-            "go" => {
-                let remaining: Vec<_> = tokens.collect();
-                self.go(&remaining, writer)?;
-            }
-            "quit" => return Ok(false),
-            // `ucinewgame` and `stop` have no stateful work in the synchronous
-            // fixed-depth engine. Unknown commands are ignored for forward compatibility.
-            _ => {}
-        }
-        Ok(true)
-    }
-
     fn identify<W: Write>(writer: &mut W) -> io::Result<()> {
         let info = EngineInfo::current();
         writeln!(writer, "id name {} {}", info.name, info.version)?;
@@ -121,63 +161,193 @@ impl Session {
         Ok(())
     }
 
-    fn go<W: Write>(&self, tokens: &[&str], writer: &mut W) -> io::Result<()> {
-        let depth = match parse_depth(tokens) {
-            Ok(depth) => depth,
-            Err(error) => {
-                writeln!(writer, "info string error: {error}")?;
-                return writeln!(writer, "bestmove 0000");
-            }
-        };
-        let prior = self
-            .history
+    fn prior_history(&self) -> &[RepetitionKey] {
+        self.history
             .strip_suffix(&[self.position.repetition_key()])
-            .unwrap_or(&self.history);
-        match search_with_history(&self.position, &ClassicalEvaluator, depth, prior) {
-            Ok(result) => write_search_result(writer, &result),
-            Err(error) => {
-                writeln!(writer, "info string error: {error}")?;
-                writeln!(writer, "bestmove 0000")
-            }
+            .unwrap_or(&self.history)
+    }
+}
+
+fn parse_go(tokens: &[&str], side: Color) -> Result<SearchLimits, String> {
+    let mut depth = 64;
+    let mut depth_specified = false;
+    let mut infinite = false;
+    let mut nodes = None;
+    let mut move_time = None;
+    let mut white_time = None;
+    let mut black_time = None;
+    let mut white_increment = 0_u64;
+    let mut black_increment = 0_u64;
+    let mut moves_to_go = 30_u64;
+    let mut index = 0;
+    while index < tokens.len() {
+        let name = tokens[index];
+        if name == "infinite" {
+            infinite = true;
+            index += 1;
+            continue;
         }
+        let recognized = matches!(
+            name,
+            "depth" | "nodes" | "movetime" | "wtime" | "btime" | "winc" | "binc" | "movestogo"
+        );
+        if !recognized {
+            index += 1;
+            continue;
+        }
+        let value = tokens
+            .get(index + 1)
+            .ok_or_else(|| format!("go {name} requires a value"))?;
+        let number = value
+            .parse::<u64>()
+            .map_err(|_| format!("invalid {name} value '{value}'"))?;
+        match name {
+            "depth" => {
+                depth_specified = true;
+                depth = u8::try_from(number)
+                    .map_err(|_| format!("search depth {number} is outside 1..=64"))?;
+                if !(1..=64).contains(&depth) {
+                    return Err(format!("search depth {depth} is outside 1..=64"));
+                }
+            }
+            "nodes" => {
+                if number == 0 {
+                    return Err("go nodes must be positive".to_owned());
+                }
+                nodes = Some(number);
+            }
+            "movetime" => move_time = Some(number),
+            "wtime" => white_time = Some(number),
+            "btime" => black_time = Some(number),
+            "winc" => white_increment = number,
+            "binc" => black_increment = number,
+            "movestogo" => {
+                if number == 0 {
+                    return Err("go movestogo must be positive".to_owned());
+                }
+                moves_to_go = number;
+            }
+            _ => unreachable!("recognized option"),
+        }
+        index += 2;
+    }
+
+    let time = move_time.map(movetime_budget).or_else(|| match side {
+        Color::White => {
+            white_time.map(|remaining| clock_budget(remaining, white_increment, moves_to_go))
+        }
+        Color::Black => {
+            black_time.map(|remaining| clock_budget(remaining, black_increment, moves_to_go))
+        }
+    });
+    if !depth_specified && nodes.is_none() && time.is_none() && !infinite {
+        depth = 1;
+    }
+    Ok(SearchLimits { depth, nodes, time })
+}
+
+fn movetime_budget(milliseconds: u64) -> Duration {
+    let margin = (milliseconds / 20).clamp(1, 10);
+    Duration::from_millis(milliseconds.saturating_sub(margin))
+}
+
+fn clock_budget(remaining: u64, increment: u64, moves_to_go: u64) -> Duration {
+    let reserve = (remaining / 20).clamp(1, 50);
+    let usable = remaining.saturating_sub(reserve);
+    let allocation = usable
+        .checked_div(moves_to_go)
+        .unwrap_or(0)
+        .saturating_add(increment.saturating_mul(3) / 4)
+        .min(usable);
+    Duration::from_millis(allocation)
+}
+
+fn run_search_worker<W: Write>(
+    position: &Position,
+    prior: &[RepetitionKey],
+    limits: SearchLimits,
+    stop: &StopToken,
+    output: &Arc<Mutex<&mut W>>,
+) -> io::Result<()> {
+    let mut output_error = None;
+    let outcome =
+        iterative_search_with_history(position, &ClassicalEvaluator, prior, limits, stop, |info| {
+            if output_error.is_none() {
+                output_error = with_output(output, |writer| write_search_info(writer, info)).err();
+                if output_error.is_some() {
+                    stop.stop();
+                }
+            }
+        });
+    if let Some(error) = output_error {
+        return Err(error);
+    }
+    match outcome {
+        Ok(outcome) => with_output(output, |writer| match outcome.best_move() {
+            Some(chess_move) => writeln!(writer, "bestmove {chess_move}"),
+            None => writeln!(writer, "bestmove 0000"),
+        }),
+        Err(error) => with_output(output, |writer| {
+            writeln!(writer, "info string error: {error}")?;
+            writeln!(writer, "bestmove 0000")
+        }),
     }
 }
 
-fn parse_depth(tokens: &[&str]) -> Result<u8, String> {
-    let Some(index) = tokens.iter().position(|&token| token == "depth") else {
-        return Ok(1);
-    };
-    let value = tokens
-        .get(index + 1)
-        .ok_or_else(|| "go depth requires a value".to_owned())?;
-    let depth = value
-        .parse::<u8>()
-        .map_err(|_| format!("invalid search depth '{value}'"))?;
-    if !(1..=64).contains(&depth) {
-        return Err(format!("search depth {depth} is outside 1..=64"));
-    }
-    Ok(depth)
-}
-
-fn write_search_result<W: Write>(writer: &mut W, result: &SearchResult) -> io::Result<()> {
+fn write_search_info<W: Write>(writer: &mut W, info: &IterationInfo) -> io::Result<()> {
+    let result = info.result();
     write!(writer, "info depth {} score ", result.depth())?;
     if let Some(moves) = result.mate_in() {
         write!(writer, "mate {moves}")?;
     } else {
         write!(writer, "cp {}", result.score().centipawns())?;
     }
-    write!(writer, " nodes {}", result.nodes())?;
+    let milliseconds = u64::try_from(info.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let nps = info
+        .nodes()
+        .saturating_mul(1_000)
+        .checked_div(milliseconds.max(1))
+        .unwrap_or(0);
+    write!(
+        writer,
+        " nodes {} time {milliseconds} nps {nps}",
+        info.nodes()
+    )?;
     if !result.principal_variation().is_empty() {
         write!(writer, " pv")?;
         for chess_move in result.principal_variation() {
             write!(writer, " {chess_move}")?;
         }
     }
-    writeln!(writer)?;
-    match result.best_move() {
-        Some(chess_move) => writeln!(writer, "bestmove {chess_move}"),
-        None => writeln!(writer, "bestmove 0000"),
+    writeln!(writer)
+}
+
+fn with_output<W: Write, T>(
+    output: &Arc<Mutex<&mut W>>,
+    operation: impl FnOnce(&mut W) -> io::Result<T>,
+) -> io::Result<T> {
+    let mut writer = output
+        .lock()
+        .map_err(|_| io::Error::other("UCI output lock was poisoned"))?;
+    let result = operation(&mut **writer)?;
+    writer.flush()?;
+    Ok(result)
+}
+
+fn stop_and_join(
+    active: &mut Option<(StopToken, thread::ScopedJoinHandle<'_, io::Result<()>>)>,
+) -> io::Result<()> {
+    if let Some(task) = active.take() {
+        task.0.stop();
+        join_search(task)?;
     }
+    Ok(())
+}
+
+fn join_search(task: (StopToken, thread::ScopedJoinHandle<'_, io::Result<()>>)) -> io::Result<()> {
+    task.1
+        .join()
+        .map_err(|_| io::Error::other("search worker panicked"))?
 }
 
 fn resolve_uci_move(position: &Position, notation: &str) -> Result<Move, String> {
@@ -191,16 +361,57 @@ fn resolve_uci_move(position: &Position, notation: &str) -> Result<Move, String>
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
+    use std::{
+        collections::VecDeque,
+        io::{self, BufRead, Read},
+        thread,
+        time::Duration,
+    };
 
-    use super::run;
-    use crate::chess::{Move, Position};
+    use super::{parse_go, run};
+    use crate::chess::{Color, Move, Position};
 
     fn transcript(input: &str) -> String {
-        let mut reader = Cursor::new(input.as_bytes());
+        let mut reader = ScriptedReader {
+            lines: input.split_inclusive('\n').map(str::to_owned).collect(),
+            delay_next: false,
+        };
         let mut output = Vec::new();
         run(&mut reader, &mut output).expect("in-memory I/O succeeds");
         String::from_utf8(output).expect("protocol output is UTF-8")
+    }
+
+    struct ScriptedReader {
+        lines: VecDeque<String>,
+        delay_next: bool,
+    }
+
+    impl Read for ScriptedReader {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl BufRead for ScriptedReader {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            Ok(&[])
+        }
+
+        fn consume(&mut self, _amount: usize) {}
+
+        fn read_line(&mut self, buffer: &mut String) -> io::Result<usize> {
+            if self.delay_next {
+                thread::sleep(Duration::from_millis(100));
+                self.delay_next = false;
+            }
+            let Some(line) = self.lines.pop_front() else {
+                return Ok(0);
+            };
+            self.delay_next = line.trim_start().starts_with("go");
+            let length = line.len();
+            buffer.push_str(&line);
+            Ok(length)
+        }
     }
 
     fn bestmoves(output: &str) -> Vec<&str> {
@@ -244,6 +455,53 @@ mod tests {
     }
 
     #[test]
+    fn go_limits_parse_depth_nodes_and_time_controls() {
+        let nodes = parse_go(&["nodes", "500"], Color::White).expect("valid nodes");
+        assert_eq!(nodes.depth, 64);
+        assert_eq!(nodes.nodes, Some(500));
+        assert_eq!(nodes.time, None);
+
+        let movetime = parse_go(&["movetime", "100"], Color::White).expect("valid movetime");
+        assert_eq!(movetime.time, Some(Duration::from_millis(95)));
+
+        let clocks = [
+            "wtime",
+            "30000",
+            "btime",
+            "9000",
+            "winc",
+            "1000",
+            "binc",
+            "200",
+            "movestogo",
+            "20",
+        ];
+        let white = parse_go(&clocks, Color::White).expect("valid clocks");
+        let black = parse_go(&clocks, Color::Black).expect("valid clocks");
+        assert_eq!(white.time, Some(Duration::from_millis(2_247)));
+        assert_eq!(black.time, Some(Duration::from_millis(597)));
+    }
+
+    #[test]
+    fn node_and_time_limited_go_commands_complete_reproducibly() {
+        let output = transcript(concat!(
+            "position startpos\n",
+            "go nodes 500\n",
+            "go nodes 500\n",
+            "go movetime 20\n",
+            "go wtime 100 btime 100 winc 5 binc 5 movestogo 20\n",
+            "quit\n"
+        ));
+        let returned = bestmoves(&output);
+
+        assert_eq!(returned.len(), 4);
+        assert_eq!(returned[0], returned[1]);
+        assert!(output.lines().any(|line| {
+            line.starts_with("info depth ") && line.contains(" time ") && line.contains(" nps ")
+        }));
+    }
+
+    #[test]
     fn position_moves_are_applied_before_go() {
         let output = transcript("position startpos moves e2e4 e7e5\ngo depth 1\nquit\n");
         let mut expected = Position::starting();
@@ -257,7 +515,8 @@ mod tests {
     fn fen_checkmate_returns_null_bestmove() {
         let output = transcript("position fen 7k/6Q1/6K1/8/8/8/8/8 b - - 0 1\ngo depth 1\n");
 
-        assert!(output.starts_with("info depth 1 score mate 0 nodes 1\n"));
+        assert!(output.starts_with("info depth 1 score mate 0 nodes 1 time "));
+        assert!(output.contains(" nps "));
         assert!(output.ends_with("bestmove 0000\n"));
     }
 
@@ -323,7 +582,7 @@ mod tests {
             "quit\n"
         ));
 
-        assert!(output.starts_with("info depth 3 score cp 0 nodes "));
+        assert!(output.contains("info depth 3 score cp 0 nodes "));
         assert_legal_bestmove(&output, &position);
     }
 
@@ -333,7 +592,7 @@ mod tests {
         let output =
             transcript("position fen 4k3/8/8/8/8/8/7Q/4K3 b - - 100 51\ngo depth 2\nquit\n");
 
-        assert!(output.starts_with("info depth 2 score cp 0 nodes "));
+        assert!(output.contains("info depth 2 score cp 0 nodes "));
         assert_legal_bestmove(&output, &position);
     }
 
@@ -341,7 +600,7 @@ mod tests {
     fn stalemate_returns_null_bestmove() {
         let output = transcript("position fen 7k/5Q2/6K1/8/8/8/8/8 b - - 0 1\ngo\nquit\n");
 
-        assert!(output.starts_with("info depth 1 score cp 0 nodes 1\n"));
+        assert!(output.starts_with("info depth 1 score cp 0 nodes 1 time "));
         assert!(output.ends_with("bestmove 0000\n"));
     }
 
@@ -365,7 +624,7 @@ mod tests {
     fn go_reports_requested_depth_score_nodes_and_pv() {
         let output = transcript("position fen 4k3/8/8/8/8/8/q7/R3K3 w - - 0 1\ngo depth 2\nquit\n");
 
-        assert!(output.starts_with("info depth 2 score cp "));
+        assert!(output.contains("info depth 2 score cp "));
         assert!(output.contains(" nodes "));
         assert!(output.contains(" pv a1a2 "));
         assert!(output.ends_with("bestmove a1a2\n"));
@@ -378,7 +637,7 @@ mod tests {
         assert_eq!(
             output,
             concat!(
-                "info string error: invalid search depth 'nope'\n",
+                "info string error: invalid depth value 'nope'\n",
                 "bestmove 0000\n",
                 "readyok\n"
             )

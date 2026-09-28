@@ -1,6 +1,15 @@
 //! Correctness-first fixed-depth negamax search with alpha-beta pruning.
 
-use std::{cmp::Reverse, error::Error, fmt};
+use std::{
+    cmp::Reverse,
+    error::Error,
+    fmt,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 use crate::{
     chess::{
@@ -16,6 +25,129 @@ const INFINITY: i32 = Score::MAX_MAGNITUDE;
 const MATE_SCORE: i32 = 900_000;
 const MATE_THRESHOLD: i32 = MATE_SCORE - (MAX_DEPTH as i32 + MAX_QUIESCENCE_PLY as i32 + 1);
 const MAX_STATIC_SCORE: i32 = 100_000;
+
+/// A clonable cancellation signal for an active search.
+#[derive(Debug, Clone, Default)]
+pub struct StopToken(Arc<AtomicBool>);
+
+impl StopToken {
+    /// Requests that the associated search stop at its next node boundary.
+    pub fn stop(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    /// Returns whether cancellation has been requested.
+    #[must_use]
+    pub fn is_stopped(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+/// Resource limits for iterative deepening.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchLimits {
+    /// Largest fully completed nominal depth.
+    pub depth: u8,
+    /// Maximum cumulative nodes across all iterations.
+    pub nodes: Option<u64>,
+    /// Maximum wall-clock search duration.
+    pub time: Option<Duration>,
+}
+
+impl SearchLimits {
+    /// Creates depth-only limits.
+    #[must_use]
+    pub const fn depth(depth: u8) -> Self {
+        Self {
+            depth,
+            nodes: None,
+            time: None,
+        }
+    }
+}
+
+/// Why an iterative search returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchTermination {
+    /// The requested depth was fully completed.
+    Completed,
+    /// [`StopToken::stop`] was requested.
+    Stopped,
+    /// The deterministic node budget was exhausted.
+    NodeLimit,
+    /// The wall-clock budget expired.
+    TimeLimit,
+}
+
+/// One fully completed iterative-deepening iteration.
+#[derive(Debug, Clone)]
+pub struct IterationInfo {
+    result: SearchResult,
+    nodes: u64,
+    elapsed: Duration,
+}
+
+impl IterationInfo {
+    /// Returns the completed fixed-depth result.
+    #[must_use]
+    pub const fn result(&self) -> &SearchResult {
+        &self.result
+    }
+
+    /// Returns cumulative nodes across all iterations.
+    #[must_use]
+    pub const fn nodes(&self) -> u64 {
+        self.nodes
+    }
+
+    /// Returns elapsed wall-clock time since iterative search began.
+    #[must_use]
+    pub const fn elapsed(&self) -> Duration {
+        self.elapsed
+    }
+}
+
+/// Final outcome from iterative deepening.
+#[derive(Debug, Clone)]
+pub struct IterativeSearchResult {
+    completed: Option<SearchResult>,
+    best_move: Option<Move>,
+    nodes: u64,
+    elapsed: Duration,
+    termination: SearchTermination,
+}
+
+impl IterativeSearchResult {
+    /// Returns the last fully completed iteration, if depth one completed.
+    #[must_use]
+    pub const fn completed(&self) -> Option<&SearchResult> {
+        self.completed.as_ref()
+    }
+
+    /// Returns the best legal move from the last completed iteration or a deterministic fallback.
+    #[must_use]
+    pub const fn best_move(&self) -> Option<Move> {
+        self.best_move
+    }
+
+    /// Returns cumulative visited nodes, including an interrupted iteration.
+    #[must_use]
+    pub const fn nodes(&self) -> u64 {
+        self.nodes
+    }
+
+    /// Returns total elapsed wall-clock time.
+    #[must_use]
+    pub const fn elapsed(&self) -> Duration {
+        self.elapsed
+    }
+
+    /// Returns why the search ended.
+    #[must_use]
+    pub const fn termination(&self) -> SearchTermination {
+        self.termination
+    }
+}
 
 /// A search setup error.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,12 +287,111 @@ pub fn search_with_history(
     }
     position.validate()?;
 
+    let (result, termination) = run_iteration(
+        position,
+        evaluator,
+        depth,
+        prior_position_keys,
+        IterationControl::unlimited(),
+    );
+    debug_assert_eq!(termination, None);
+    Ok(result)
+}
+
+/// Iteratively searches depths `1..=limits.depth`, publishing only completed iterations.
+///
+/// The node budget is deterministic and cumulative across iterations. Cancellation and time
+/// expiration are observed at node boundaries. If depth one does not complete, the returned best
+/// move is a deterministic legal fallback.
+///
+/// # Errors
+///
+/// Returns [`SearchError::InvalidDepth`] when the requested depth is outside `1..=64`, and
+/// [`SearchError::InvalidPosition`] when root validation fails.
+pub fn iterative_search_with_history<F>(
+    position: &Position,
+    evaluator: &dyn Evaluator,
+    prior_position_keys: &[RepetitionKey],
+    limits: SearchLimits,
+    stop: &StopToken,
+    mut on_iteration: F,
+) -> Result<IterativeSearchResult, SearchError>
+where
+    F: FnMut(&IterationInfo),
+{
+    if !(1..=MAX_DEPTH).contains(&limits.depth) {
+        return Err(SearchError::InvalidDepth(limits.depth));
+    }
+    position.validate()?;
+
+    let started = Instant::now();
+    let deadline = limits
+        .time
+        .and_then(|duration| started.checked_add(duration));
+    let mut total_nodes = 0_u64;
+    let mut completed = None;
+    let mut termination = SearchTermination::Completed;
+
+    for depth in 1..=limits.depth {
+        let remaining_nodes = limits.nodes.map(|limit| limit.saturating_sub(total_nodes));
+        if remaining_nodes == Some(0) {
+            termination = SearchTermination::NodeLimit;
+            break;
+        }
+        let (result, interrupted) = run_iteration(
+            position,
+            evaluator,
+            depth,
+            prior_position_keys,
+            IterationControl {
+                stop: Some(stop),
+                deadline,
+                node_limit: remaining_nodes,
+            },
+        );
+        total_nodes = total_nodes.saturating_add(result.nodes());
+        if let Some(reason) = interrupted {
+            termination = reason.into();
+            break;
+        }
+
+        let info = IterationInfo {
+            result: result.clone(),
+            nodes: total_nodes,
+            elapsed: started.elapsed(),
+        };
+        on_iteration(&info);
+        completed = Some(result);
+    }
+
+    let best_move = completed
+        .as_ref()
+        .and_then(SearchResult::best_move)
+        .or_else(|| first_legal_move(position));
+    Ok(IterativeSearchResult {
+        completed,
+        best_move,
+        nodes: total_nodes,
+        elapsed: started.elapsed(),
+        termination,
+    })
+}
+
+fn run_iteration(
+    position: &Position,
+    evaluator: &dyn Evaluator,
+    depth: u8,
+    prior_position_keys: &[RepetitionKey],
+    control: IterationControl<'_>,
+) -> (SearchResult, Option<AbortReason>) {
     let mut working = position.clone();
     let mut context = SearchContext {
         evaluator,
         nodes: 0,
         quiescence_nodes: 0,
         history: prior_position_keys.to_vec(),
+        control,
+        aborted: None,
     };
     context.history.push(position.repetition_key());
     let result = context.negamax(&mut working, depth, -INFINITY, INFINITY, 0);
@@ -169,14 +400,15 @@ pub fn search_with_history(
         .first()
         .copied()
         .or_else(|| first_legal_move(position));
-    Ok(SearchResult {
+    let result = SearchResult {
         depth,
         score: Score::from_centipawns(result.score),
         nodes: context.nodes,
         quiescence_nodes: context.quiescence_nodes,
         best_move,
         principal_variation: result.line,
-    })
+    };
+    (result, context.aborted)
 }
 
 struct SearchContext<'a> {
@@ -184,6 +416,42 @@ struct SearchContext<'a> {
     nodes: u64,
     quiescence_nodes: u64,
     history: Vec<RepetitionKey>,
+    control: IterationControl<'a>,
+    aborted: Option<AbortReason>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AbortReason {
+    Stopped,
+    NodeLimit,
+    TimeLimit,
+}
+
+impl From<AbortReason> for SearchTermination {
+    fn from(reason: AbortReason) -> Self {
+        match reason {
+            AbortReason::Stopped => Self::Stopped,
+            AbortReason::NodeLimit => Self::NodeLimit,
+            AbortReason::TimeLimit => Self::TimeLimit,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct IterationControl<'a> {
+    stop: Option<&'a StopToken>,
+    deadline: Option<Instant>,
+    node_limit: Option<u64>,
+}
+
+impl IterationControl<'_> {
+    const fn unlimited() -> Self {
+        Self {
+            stop: None,
+            deadline: None,
+            node_limit: None,
+        }
+    }
 }
 
 struct NodeResult {
@@ -206,7 +474,12 @@ impl SearchContext<'_> {
                 line: Vec::new(),
             };
         }
-        self.nodes = self.nodes.saturating_add(1);
+        if !self.visit_node(false) {
+            return NodeResult {
+                score: 0,
+                line: Vec::new(),
+            };
+        }
         let mut moves = generate_legal_moves_unchecked(position);
         if moves.is_empty() {
             let score = if is_in_check_unchecked(position, position.side_to_move()) {
@@ -249,6 +522,12 @@ impl SearchContext<'_> {
             self.history.pop();
             let score = -child.score;
             position.unmake_move(undo);
+            if self.aborted.is_some() {
+                return NodeResult {
+                    score: 0,
+                    line: Vec::new(),
+                };
+            }
 
             if score > best_score {
                 best_score = score;
@@ -275,8 +554,9 @@ impl SearchContext<'_> {
         ply: u16,
         quiescence_ply: u8,
     ) -> i32 {
-        self.nodes = self.nodes.saturating_add(1);
-        self.quiescence_nodes = self.quiescence_nodes.saturating_add(1);
+        if !self.visit_node(true) {
+            return 0;
+        }
 
         let mut moves = generate_legal_moves_unchecked(position);
         if moves.is_empty() {
@@ -342,6 +622,9 @@ impl SearchContext<'_> {
             let score = -self.quiescence(position, -beta, -alpha, ply + 1, quiescence_ply + 1);
             self.history.pop();
             position.unmake_move(undo);
+            if self.aborted.is_some() {
+                return 0;
+            }
 
             best_score = best_score.max(score);
             alpha = alpha.max(score);
@@ -374,6 +657,9 @@ impl SearchContext<'_> {
             let score = -self.capped_leaf_score(position, ply + 1);
             self.history.pop();
             position.unmake_move(undo);
+            if self.aborted.is_some() {
+                return 0;
+            }
 
             best_score = best_score.max(score);
             alpha = alpha.max(score);
@@ -385,8 +671,9 @@ impl SearchContext<'_> {
     }
 
     fn capped_leaf_score(&mut self, position: &Position, ply: u16) -> i32 {
-        self.nodes = self.nodes.saturating_add(1);
-        self.quiescence_nodes = self.quiescence_nodes.saturating_add(1);
+        if !self.visit_node(true) {
+            return 0;
+        }
 
         let moves = generate_legal_moves_unchecked(position);
         if moves.is_empty() {
@@ -419,6 +706,37 @@ impl SearchContext<'_> {
     fn repetition_count(&self, current: RepetitionKey) -> usize {
         self.history.iter().filter(|&&key| key == current).count()
     }
+
+    fn visit_node(&mut self, quiescence: bool) -> bool {
+        if self.aborted.is_some() {
+            return false;
+        }
+        if self.control.stop.is_some_and(StopToken::is_stopped) {
+            self.aborted = Some(AbortReason::Stopped);
+            return false;
+        }
+        if self
+            .control
+            .node_limit
+            .is_some_and(|limit| self.nodes >= limit)
+        {
+            self.aborted = Some(AbortReason::NodeLimit);
+            return false;
+        }
+        if self
+            .control
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.aborted = Some(AbortReason::TimeLimit);
+            return false;
+        }
+        self.nodes = self.nodes.saturating_add(1);
+        if quiescence {
+            self.quiescence_nodes = self.quiescence_nodes.saturating_add(1);
+        }
+        true
+    }
 }
 
 fn order_moves(moves: &mut [Move]) {
@@ -445,11 +763,12 @@ fn move_priority(chess_move: Move) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
+    use std::{cell::Cell, time::Duration};
 
     use super::{
-        INFINITY, MATE_SCORE, MAX_QUIESCENCE_PLY, MAX_STATIC_SCORE, SearchContext, SearchError,
-        search, search_with_history,
+        INFINITY, IterationControl, MATE_SCORE, MAX_QUIESCENCE_PLY, MAX_STATIC_SCORE,
+        SearchContext, SearchError, SearchLimits, SearchResult, SearchTermination, StopToken,
+        iterative_search_with_history, search, search_with_history,
     };
     use crate::{
         chess::{
@@ -465,6 +784,157 @@ mod tests {
             search(&Position::starting(), &ClassicalEvaluator, 0),
             Err(SearchError::InvalidDepth(0))
         );
+    }
+
+    #[test]
+    fn iterative_deepening_publishes_only_complete_matching_iterations() {
+        let position = Position::starting();
+        let stop = StopToken::default();
+        let mut published = Vec::new();
+        let outcome = iterative_search_with_history(
+            &position,
+            &ClassicalEvaluator,
+            &[],
+            SearchLimits::depth(3),
+            &stop,
+            |info| published.push(info.result().clone()),
+        )
+        .expect("search succeeds");
+
+        assert_eq!(outcome.termination(), SearchTermination::Completed);
+        assert_eq!(published.len(), 3);
+        for (index, result) in published.iter().enumerate() {
+            let depth = u8::try_from(index + 1).expect("small depth");
+            assert_eq!(
+                result,
+                &search(&position, &ClassicalEvaluator, depth).unwrap()
+            );
+        }
+        assert_eq!(outcome.completed(), published.last());
+        assert_eq!(
+            outcome.best_move(),
+            published.last().and_then(SearchResult::best_move)
+        );
+    }
+
+    #[test]
+    fn deterministic_node_limit_keeps_partial_iteration_private() {
+        let position = Position::starting();
+        let limits = SearchLimits {
+            depth: 8,
+            nodes: Some(1),
+            time: None,
+        };
+        let outcome = iterative_search_with_history(
+            &position,
+            &ClassicalEvaluator,
+            &[],
+            limits,
+            &StopToken::default(),
+            |_| panic!("no iteration should complete"),
+        )
+        .expect("search succeeds");
+
+        assert_eq!(outcome.termination(), SearchTermination::NodeLimit);
+        assert_eq!(outcome.nodes(), 1);
+        assert!(outcome.completed().is_none());
+        assert!(
+            position
+                .legal_moves()
+                .unwrap()
+                .contains(&outcome.best_move().expect("legal fallback"))
+        );
+    }
+
+    #[test]
+    fn node_limited_search_is_exact_and_reproducible() {
+        let position = Position::starting();
+        let limits = SearchLimits {
+            depth: 64,
+            nodes: Some(500),
+            time: None,
+        };
+        let run = || {
+            iterative_search_with_history(
+                &position,
+                &ClassicalEvaluator,
+                &[],
+                limits,
+                &StopToken::default(),
+                |_| {},
+            )
+            .expect("search succeeds")
+        };
+        let first = run();
+        let second = run();
+
+        assert_eq!(first.termination(), SearchTermination::NodeLimit);
+        assert_eq!(first.nodes(), 500);
+        assert_eq!(second.nodes(), 500);
+        assert_eq!(first.best_move(), second.best_move());
+        assert_eq!(first.completed(), second.completed());
+    }
+
+    #[test]
+    fn iterative_search_preserves_history_draw_scoring() {
+        let position = Position::from_fen("4k3/8/8/8/8/8/7Q/4K3 b - - 100 51").expect("valid FEN");
+        let prior = [position.repetition_key(), position.repetition_key()];
+        let outcome = iterative_search_with_history(
+            &position,
+            &ClassicalEvaluator,
+            &prior,
+            SearchLimits::depth(2),
+            &StopToken::default(),
+            |_| {},
+        )
+        .expect("search succeeds");
+
+        assert_eq!(outcome.completed().unwrap().score(), Score::ZERO);
+        assert!(outcome.best_move().is_some());
+    }
+
+    #[test]
+    fn cancellation_before_first_node_returns_immediately_with_fallback() {
+        let position = Position::starting();
+        let stop = StopToken::default();
+        stop.stop();
+        let outcome = iterative_search_with_history(
+            &position,
+            &ClassicalEvaluator,
+            &[],
+            SearchLimits::depth(64),
+            &stop,
+            |_| panic!("no iteration should complete"),
+        )
+        .expect("search succeeds");
+
+        assert_eq!(outcome.termination(), SearchTermination::Stopped);
+        assert_eq!(outcome.nodes(), 0);
+        assert!(outcome.completed().is_none());
+        assert!(outcome.best_move().is_some());
+    }
+
+    #[test]
+    fn expired_time_limit_returns_without_publishing_partial_work() {
+        let position = Position::starting();
+        let outcome = iterative_search_with_history(
+            &position,
+            &ClassicalEvaluator,
+            &[],
+            SearchLimits {
+                depth: 64,
+                nodes: None,
+                time: Some(Duration::ZERO),
+            },
+            &StopToken::default(),
+            |_| panic!("no iteration should complete"),
+        )
+        .expect("search succeeds");
+
+        assert_eq!(outcome.termination(), SearchTermination::TimeLimit);
+        assert_eq!(outcome.nodes(), 0);
+        assert!(outcome.completed().is_none());
+        assert!(outcome.best_move().is_some());
     }
 
     #[test]
@@ -542,6 +1012,8 @@ mod tests {
             nodes: 0,
             quiescence_nodes: 0,
             history: vec![position.repetition_key()],
+            control: IterationControl::unlimited(),
+            aborted: None,
         };
         let alpha_beta = context.negamax(&mut alpha_beta_position, 2, -INFINITY, INFINITY, 0);
         let mut reference_position = position;
@@ -761,6 +1233,8 @@ mod tests {
             nodes: 0,
             quiescence_nodes: 0,
             history: vec![position.repetition_key()],
+            control: IterationControl::unlimited(),
+            aborted: None,
         };
 
         let score = context.quiescence(
@@ -809,6 +1283,8 @@ mod tests {
             nodes: 0,
             quiescence_nodes: 0,
             history: vec![position.repetition_key()],
+            control: IterationControl::unlimited(),
+            aborted: None,
         };
 
         context.quiescence(&mut working, -INFINITY, INFINITY, 0, 0);
@@ -827,6 +1303,8 @@ mod tests {
             nodes: 0,
             quiescence_nodes: 0,
             history: vec![position.repetition_key()],
+            control: IterationControl::unlimited(),
+            aborted: None,
         };
         let alpha = -1_000;
         let beta = 1_000;
@@ -904,6 +1382,8 @@ mod tests {
             nodes: 0,
             quiescence_nodes: 0,
             history: vec![position.repetition_key()],
+            control: IterationControl::unlimited(),
+            aborted: None,
         };
         let score = context.quiescence(&mut working, -INFINITY, INFINITY, 0, 0);
         assert_eq!(working, *position);

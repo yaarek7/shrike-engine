@@ -5,10 +5,10 @@ development process.
 
 ## Status
 
-Milestone M8 is complete: fixed-depth alpha-beta now evaluates nominal leaves with bounded
-quiescence search over captures, promotions, and legal check evasions. Search results report total
-and quiescence node counts while keeping principal variations limited to nominal-depth moves.
-Draw-aware history and deterministic repetition keys remain part of the search boundary.
+The engine now has a tournament-facing search controller above the M8 alpha-beta and quiescence
+core. It performs iterative deepening, supports deterministic node limits and wall-clock budgets,
+can be interrupted by UCI `stop`, and reports cumulative nodes, elapsed time, NPS, score, and PV
+after every completed iteration. Draw-aware history remains part of every iteration.
 
 ## Requirements
 
