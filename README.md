@@ -5,10 +5,10 @@ development process.
 
 ## Status
 
-Milestone M7 is complete: the engine now has deterministic incremental repetition keys,
-history-aware search, fifty-move handling, and conservative insufficient-material draws in
-addition to the M6 fixed-depth alpha-beta baseline. The UCI position command retains repetition
-history for search.
+Milestone M8 is complete: fixed-depth alpha-beta now evaluates nominal leaves with bounded
+quiescence search over captures, promotions, and legal check evasions. Search results report total
+and quiescence node counts while keeping principal variations limited to nominal-depth moves.
+Draw-aware history and deterministic repetition keys remain part of the search boundary.
 
 ## Requirements
 

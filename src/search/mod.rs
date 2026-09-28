@@ -4,15 +4,17 @@ use std::{cmp::Reverse, error::Error, fmt};
 
 use crate::{
     chess::{
-        Move, Position, PositionError, RepetitionKey, movegen::generate_legal_moves_unchecked,
+        Move, Position, PositionError, RepetitionKey,
+        movegen::{generate_legal_moves_unchecked, is_in_check_unchecked},
     },
     eval::{Evaluator, Score},
 };
 
 const MAX_DEPTH: u8 = 64;
+const MAX_QUIESCENCE_PLY: u8 = 32;
 const INFINITY: i32 = Score::MAX_MAGNITUDE;
 const MATE_SCORE: i32 = 900_000;
-const MATE_THRESHOLD: i32 = MATE_SCORE - 64;
+const MATE_THRESHOLD: i32 = MATE_SCORE - (MAX_DEPTH as i32 + MAX_QUIESCENCE_PLY as i32 + 1);
 const MAX_STATIC_SCORE: i32 = 100_000;
 
 /// A search setup error.
@@ -56,6 +58,7 @@ pub struct SearchResult {
     depth: u8,
     score: Score,
     nodes: u64,
+    quiescence_nodes: u64,
     best_move: Option<Move>,
     principal_variation: Vec<Move>,
 }
@@ -73,10 +76,16 @@ impl SearchResult {
         self.score
     }
 
-    /// Returns the number of visited negamax nodes, including the root.
+    /// Returns the total number of visited nodes, including quiescence nodes and the root.
     #[must_use]
     pub const fn nodes(&self) -> u64 {
         self.nodes
+    }
+
+    /// Returns the number of visited quiescence nodes.
+    #[must_use]
+    pub const fn quiescence_nodes(&self) -> u64 {
+        self.quiescence_nodes
     }
 
     /// Returns a legal root move when one exists.
@@ -88,9 +97,10 @@ impl SearchResult {
         self.best_move
     }
 
-    /// Returns the searched principal variation in root-to-leaf order.
+    /// Returns the nominal-depth principal variation in root-to-leaf order.
     ///
-    /// This is empty when a draw claim or automatic draw is selected at the root.
+    /// Quiescence moves are intentionally excluded. This is empty when a draw
+    /// claim or automatic draw is selected at the root.
     #[must_use]
     pub fn principal_variation(&self) -> &[Move] {
         &self.principal_variation
@@ -149,6 +159,7 @@ pub fn search_with_history(
     let mut context = SearchContext {
         evaluator,
         nodes: 0,
+        quiescence_nodes: 0,
         history: prior_position_keys.to_vec(),
     };
     context.history.push(position.repetition_key());
@@ -162,6 +173,7 @@ pub fn search_with_history(
         depth,
         score: Score::from_centipawns(result.score),
         nodes: context.nodes,
+        quiescence_nodes: context.quiescence_nodes,
         best_move,
         principal_variation: result.line,
     })
@@ -170,6 +182,7 @@ pub fn search_with_history(
 struct SearchContext<'a> {
     evaluator: &'a dyn Evaluator,
     nodes: u64,
+    quiescence_nodes: u64,
     history: Vec<RepetitionKey>,
 }
 
@@ -185,15 +198,18 @@ impl SearchContext<'_> {
         depth: u8,
         mut alpha: i32,
         beta: i32,
-        ply: u8,
+        ply: u16,
     ) -> NodeResult {
+        if depth == 0 {
+            return NodeResult {
+                score: self.quiescence(position, alpha, beta, ply, 0),
+                line: Vec::new(),
+            };
+        }
         self.nodes = self.nodes.saturating_add(1);
         let mut moves = generate_legal_moves_unchecked(position);
         if moves.is_empty() {
-            let score = if position
-                .is_in_check(position.side_to_move())
-                .expect("descendants of a validated root remain valid")
-            {
+            let score = if is_in_check_unchecked(position, position.side_to_move()) {
                 -MATE_SCORE + i32::from(ply)
             } else {
                 0
@@ -214,22 +230,6 @@ impl SearchContext<'_> {
             };
         }
         let can_claim_draw = position.halfmove_clock() >= 100 || repetitions >= 3;
-        if depth == 0 {
-            let evaluation = self
-                .evaluator
-                .evaluate(position)
-                .centipawns()
-                .clamp(-MAX_STATIC_SCORE, MAX_STATIC_SCORE);
-            return NodeResult {
-                score: if can_claim_draw {
-                    evaluation.max(0)
-                } else {
-                    evaluation
-                },
-                line: Vec::new(),
-            };
-        }
-
         order_moves(&mut moves);
         let mut best_score = if can_claim_draw { 0 } else { -INFINITY };
         let mut best_line = Vec::new();
@@ -267,6 +267,155 @@ impl SearchContext<'_> {
         }
     }
 
+    fn quiescence(
+        &mut self,
+        position: &mut Position,
+        mut alpha: i32,
+        beta: i32,
+        ply: u16,
+        quiescence_ply: u8,
+    ) -> i32 {
+        self.nodes = self.nodes.saturating_add(1);
+        self.quiescence_nodes = self.quiescence_nodes.saturating_add(1);
+
+        let mut moves = generate_legal_moves_unchecked(position);
+        if moves.is_empty() {
+            return if is_in_check_unchecked(position, position.side_to_move()) {
+                -MATE_SCORE + i32::from(ply)
+            } else {
+                0
+            };
+        }
+
+        let repetitions = self.repetition_count(position.repetition_key());
+        if position.halfmove_clock() >= 150
+            || repetitions >= 5
+            || position.has_insufficient_material()
+        {
+            return 0;
+        }
+        let can_claim_draw = position.halfmove_clock() >= 100 || repetitions >= 3;
+        let static_evaluation = || {
+            let evaluation = self
+                .evaluator
+                .evaluate(position)
+                .centipawns()
+                .clamp(-MAX_STATIC_SCORE, MAX_STATIC_SCORE);
+            if can_claim_draw {
+                evaluation.max(0)
+            } else {
+                evaluation
+            }
+        };
+        let in_check = is_in_check_unchecked(position, position.side_to_move());
+        if quiescence_ply >= MAX_QUIESCENCE_PLY {
+            if in_check {
+                return self.search_capped_evasions(
+                    position,
+                    moves,
+                    alpha,
+                    beta,
+                    ply,
+                    can_claim_draw,
+                );
+            }
+            return static_evaluation();
+        }
+
+        let mut best_score = if in_check {
+            if can_claim_draw { 0 } else { -INFINITY }
+        } else {
+            static_evaluation()
+        };
+        alpha = alpha.max(best_score);
+        if alpha >= beta {
+            return best_score;
+        }
+
+        if !in_check {
+            moves.retain(|chess_move| chess_move.is_capture() || chess_move.promotion().is_some());
+        }
+        order_moves(&mut moves);
+        for chess_move in moves {
+            let undo = position.apply_move_unchecked(chess_move);
+            self.history.push(position.repetition_key());
+            let score = -self.quiescence(position, -beta, -alpha, ply + 1, quiescence_ply + 1);
+            self.history.pop();
+            position.unmake_move(undo);
+
+            best_score = best_score.max(score);
+            alpha = alpha.max(score);
+            if alpha >= beta {
+                break;
+            }
+        }
+        best_score
+    }
+
+    fn search_capped_evasions(
+        &mut self,
+        position: &mut Position,
+        mut moves: Vec<Move>,
+        mut alpha: i32,
+        beta: i32,
+        ply: u16,
+        can_claim_draw: bool,
+    ) -> i32 {
+        order_moves(&mut moves);
+        let mut best_score = if can_claim_draw { 0 } else { -INFINITY };
+        alpha = alpha.max(best_score);
+        if alpha >= beta {
+            return best_score;
+        }
+
+        for chess_move in moves {
+            let undo = position.apply_move_unchecked(chess_move);
+            self.history.push(position.repetition_key());
+            let score = -self.capped_leaf_score(position, ply + 1);
+            self.history.pop();
+            position.unmake_move(undo);
+
+            best_score = best_score.max(score);
+            alpha = alpha.max(score);
+            if alpha >= beta {
+                break;
+            }
+        }
+        best_score
+    }
+
+    fn capped_leaf_score(&mut self, position: &Position, ply: u16) -> i32 {
+        self.nodes = self.nodes.saturating_add(1);
+        self.quiescence_nodes = self.quiescence_nodes.saturating_add(1);
+
+        let moves = generate_legal_moves_unchecked(position);
+        if moves.is_empty() {
+            return if is_in_check_unchecked(position, position.side_to_move()) {
+                -MATE_SCORE + i32::from(ply)
+            } else {
+                0
+            };
+        }
+
+        let repetitions = self.repetition_count(position.repetition_key());
+        if position.halfmove_clock() >= 150
+            || repetitions >= 5
+            || position.has_insufficient_material()
+        {
+            return 0;
+        }
+        let evaluation = self
+            .evaluator
+            .evaluate(position)
+            .centipawns()
+            .clamp(-MAX_STATIC_SCORE, MAX_STATIC_SCORE);
+        if position.halfmove_clock() >= 100 || repetitions >= 3 {
+            evaluation.max(0)
+        } else {
+            evaluation
+        }
+    }
+
     fn repetition_count(&self, current: RepetitionKey) -> usize {
         self.history.iter().filter(|&&key| key == current).count()
     }
@@ -296,12 +445,17 @@ fn move_priority(chess_move: Move) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::{
-        INFINITY, MATE_SCORE, MAX_STATIC_SCORE, SearchContext, SearchError, search,
-        search_with_history,
+        INFINITY, MATE_SCORE, MAX_QUIESCENCE_PLY, MAX_STATIC_SCORE, SearchContext, SearchError,
+        search, search_with_history,
     };
     use crate::{
-        chess::{Move, Position, movegen::generate_legal_moves_unchecked},
+        chess::{
+            Color, Move, Piece, PieceKind, Position, Square,
+            movegen::generate_legal_moves_unchecked,
+        },
         eval::{ClassicalEvaluator, Evaluator, Score},
     };
 
@@ -328,6 +482,8 @@ mod tests {
         assert_eq!(position, original);
         assert_eq!(result.depth(), 2);
         assert!(result.nodes() > 20);
+        assert!(result.quiescence_nodes() > 0);
+        assert!(result.nodes() >= result.quiescence_nodes());
         assert_eq!(result.principal_variation().len(), 2);
     }
 
@@ -384,15 +540,16 @@ mod tests {
         let mut context = SearchContext {
             evaluator: &ClassicalEvaluator,
             nodes: 0,
+            quiescence_nodes: 0,
             history: vec![position.repetition_key()],
         };
-        let alpha_beta = context.negamax(&mut alpha_beta_position, 3, -INFINITY, INFINITY, 0);
+        let alpha_beta = context.negamax(&mut alpha_beta_position, 2, -INFINITY, INFINITY, 0);
         let mut reference_position = position;
         let mut reference_nodes = 0;
         let reference = unpruned(
             &mut reference_position,
             &ClassicalEvaluator,
-            3,
+            2,
             0,
             &mut reference_nodes,
         );
@@ -416,6 +573,7 @@ mod tests {
         for &chess_move in first.principal_variation() {
             replay.make_move(chess_move).expect("PV move is legal");
         }
+        assert!(first.principal_variation().len() <= usize::from(first.depth()));
     }
 
     #[test]
@@ -519,6 +677,199 @@ mod tests {
     }
 
     #[test]
+    fn quiescence_rejects_a_poisoned_capture() {
+        let position = Position::from_fen("4k3/8/5n2/3p4/8/8/8/3QK3 w - - 0 1").expect("valid FEN");
+        let result = search(&position, &ClassicalEvaluator, 1).expect("search succeeds");
+
+        assert_ne!(
+            result.best_move().map(Move::to_uci).as_deref(),
+            Some("d1d5")
+        );
+        eprintln!(
+            "poisoned capture: total nodes {}, quiescence nodes {}",
+            result.nodes(),
+            result.quiescence_nodes()
+        );
+        assert!(result.quiescence_nodes() > 0);
+        assert_eq!(result.principal_variation().len(), 1);
+    }
+
+    #[test]
+    fn quiescence_stabilizes_a_forced_recapture() {
+        let position = Position::from_fen("4k3/8/5n2/3Q4/8/8/8/4K3 b - - 0 1").expect("valid FEN");
+        let stand_pat = ClassicalEvaluator.evaluate(&position).centipawns();
+        let (score, nodes) = quiescence_score(&position);
+
+        assert!(score > stand_pat + 500);
+        assert!(nodes > 1);
+    }
+
+    #[test]
+    fn quiescence_searches_quiet_promotions_and_en_passant() {
+        for fen in [
+            "8/P3k3/8/8/8/8/8/4K3 w - - 0 1",
+            "4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1",
+        ] {
+            let position = Position::from_fen(fen).expect("valid FEN");
+            let stand_pat = ClassicalEvaluator.evaluate(&position).centipawns();
+            let (score, nodes) = quiescence_score(&position);
+
+            assert!(score > stand_pat, "expected tactical improvement: {fen}");
+            assert!(nodes > 1, "expected a quiescence move: {fen}");
+        }
+    }
+
+    #[test]
+    fn quiescence_searches_all_evasions_when_in_check() {
+        let position = Position::from_fen("4k3/8/8/8/8/8/8/4R1K1 b - - 0 1").expect("valid FEN");
+        let legal_moves = position.legal_moves().expect("valid position");
+        assert!(
+            legal_moves
+                .iter()
+                .all(|chess_move| !chess_move.is_capture())
+        );
+
+        let (_, nodes) = quiescence_score(&position);
+
+        assert!(nodes > 1);
+    }
+
+    #[test]
+    fn quiescence_recognizes_horizon_mate_and_stalemate() {
+        let checkmate = Position::from_fen("7k/6Q1/6K1/8/8/8/8/8 b - - 0 1").expect("valid FEN");
+        let stalemate = Position::from_fen("7k/5Q2/6K1/8/8/8/8/8 b - - 0 1").expect("valid FEN");
+
+        assert_eq!(quiescence_score(&checkmate).0, -MATE_SCORE);
+        assert_eq!(quiescence_score(&stalemate).0, 0);
+    }
+
+    #[test]
+    fn quiescence_guard_bounds_checked_extensions() {
+        struct ConstantEvaluator;
+
+        impl Evaluator for ConstantEvaluator {
+            fn evaluate(&self, _position: &Position) -> Score {
+                Score::from_centipawns(321)
+            }
+        }
+
+        let position = Position::from_fen("4k3/8/8/8/8/8/8/4R1K1 b - - 0 1").expect("valid FEN");
+        let legal_moves = position.legal_moves().expect("valid position");
+        let mut working = position.clone();
+        let mut context = SearchContext {
+            evaluator: &ConstantEvaluator,
+            nodes: 0,
+            quiescence_nodes: 0,
+            history: vec![position.repetition_key()],
+        };
+
+        let score = context.quiescence(
+            &mut working,
+            -INFINITY,
+            INFINITY,
+            u16::from(MAX_QUIESCENCE_PLY),
+            MAX_QUIESCENCE_PLY,
+        );
+
+        assert_eq!(score, -321);
+        assert_ne!(score, ConstantEvaluator.evaluate(&position).centipawns());
+        assert_eq!(context.nodes, 1 + legal_moves.len() as u64);
+        assert_eq!(context.quiescence_nodes, context.nodes);
+        assert_eq!(working, position);
+    }
+
+    #[test]
+    fn quiescence_searches_every_capture_underpromotion() {
+        struct PromotionObserver {
+            seen: Cell<u8>,
+        }
+
+        impl Evaluator for PromotionObserver {
+            fn evaluate(&self, position: &Position) -> Score {
+                let promotion_square = Square::new(0, 7).expect("a8 is on board");
+                for (bit, kind) in [
+                    (1, PieceKind::Knight),
+                    (2, PieceKind::Bishop),
+                    (4, PieceKind::Rook),
+                    (8, PieceKind::Queen),
+                ] {
+                    if position.piece_at(promotion_square) == Some(Piece::new(Color::White, kind)) {
+                        self.seen.set(self.seen.get() | bit);
+                    }
+                }
+                Score::ZERO
+            }
+        }
+
+        let position = Position::from_fen("r7/1P2k3/8/7p/8/8/8/4K3 w - - 0 1").expect("valid FEN");
+        let observer = PromotionObserver { seen: Cell::new(0) };
+        let mut working = position.clone();
+        let mut context = SearchContext {
+            evaluator: &observer,
+            nodes: 0,
+            quiescence_nodes: 0,
+            history: vec![position.repetition_key()],
+        };
+
+        context.quiescence(&mut working, -INFINITY, INFINITY, 0, 0);
+
+        assert_eq!(observer.seen.get(), 0b1111);
+        assert_eq!(working, position);
+    }
+
+    #[test]
+    fn quiescence_alpha_beta_matches_unpruned_reference_and_prunes() {
+        let position =
+            Position::from_fen("4k3/8/2n2n2/3Q4/2n2n2/8/8/4K3 w - - 0 1").expect("valid FEN");
+        let mut working = position.clone();
+        let mut context = SearchContext {
+            evaluator: &ClassicalEvaluator,
+            nodes: 0,
+            quiescence_nodes: 0,
+            history: vec![position.repetition_key()],
+        };
+        let alpha = -1_000;
+        let beta = 1_000;
+        let score = context.quiescence(&mut working, alpha, beta, 0, 0);
+        let mut reference = position.clone();
+        let mut reference_nodes = 0;
+        let reference_score = unpruned_quiescence(
+            &mut reference,
+            &ClassicalEvaluator,
+            0,
+            0,
+            &mut reference_nodes,
+        );
+
+        assert_eq!(score, reference_score);
+        assert!(score > alpha && score < beta);
+        eprintln!(
+            "quiescence alpha-beta nodes: {}, unpruned nodes: {reference_nodes}",
+            context.quiescence_nodes
+        );
+        assert!(context.quiescence_nodes < reference_nodes);
+        assert_eq!(working, position);
+        assert_eq!(reference, position);
+    }
+
+    #[test]
+    fn mate_discovered_by_a_quiescence_capture_stays_in_the_mate_band() {
+        let position = Position::from_fen("7k/7r/6KQ/8/8/8/8/8 w - - 0 1").expect("valid FEN");
+        let (score, nodes) = quiescence_score(&position);
+        let result = super::SearchResult {
+            depth: 1,
+            score: Score::from_centipawns(score),
+            nodes,
+            quiescence_nodes: nodes,
+            best_move: None,
+            principal_variation: Vec::new(),
+        };
+
+        assert_eq!(score, MATE_SCORE - 1);
+        assert_eq!(result.mate_in(), Some(1));
+    }
+
+    #[test]
     fn extreme_static_scores_are_clamped_below_mate_band() {
         struct ExtremeEvaluator;
 
@@ -546,13 +897,100 @@ mod tests {
         assert_eq!(position, original);
     }
 
+    fn quiescence_score(position: &Position) -> (i32, u64) {
+        let mut working = position.clone();
+        let mut context = SearchContext {
+            evaluator: &ClassicalEvaluator,
+            nodes: 0,
+            quiescence_nodes: 0,
+            history: vec![position.repetition_key()],
+        };
+        let score = context.quiescence(&mut working, -INFINITY, INFINITY, 0, 0);
+        assert_eq!(working, *position);
+        (score, context.quiescence_nodes)
+    }
+
+    fn unpruned_quiescence(
+        position: &mut Position,
+        evaluator: &dyn Evaluator,
+        ply: u16,
+        quiescence_ply: u8,
+        nodes: &mut u64,
+    ) -> i32 {
+        *nodes += 1;
+        let mut moves = generate_legal_moves_unchecked(position);
+        if moves.is_empty() {
+            return if super::is_in_check_unchecked(position, position.side_to_move()) {
+                -MATE_SCORE + i32::from(ply)
+            } else {
+                0
+            };
+        }
+        let in_check = super::is_in_check_unchecked(position, position.side_to_move());
+        if quiescence_ply >= MAX_QUIESCENCE_PLY && !in_check {
+            return evaluator
+                .evaluate(position)
+                .centipawns()
+                .clamp(-MAX_STATIC_SCORE, MAX_STATIC_SCORE);
+        }
+        if quiescence_ply >= MAX_QUIESCENCE_PLY {
+            let mut best = -INFINITY;
+            for chess_move in moves {
+                let undo = position.apply_move_unchecked(chess_move);
+                *nodes += 1;
+                let child_moves = generate_legal_moves_unchecked(position);
+                let child = if child_moves.is_empty() {
+                    if super::is_in_check_unchecked(position, position.side_to_move()) {
+                        -MATE_SCORE + i32::from(ply + 1)
+                    } else {
+                        0
+                    }
+                } else {
+                    evaluator
+                        .evaluate(position)
+                        .centipawns()
+                        .clamp(-MAX_STATIC_SCORE, MAX_STATIC_SCORE)
+                };
+                best = best.max(-child);
+                position.unmake_move(undo);
+            }
+            return best;
+        }
+        let mut best = if in_check {
+            -INFINITY
+        } else {
+            evaluator
+                .evaluate(position)
+                .centipawns()
+                .clamp(-MAX_STATIC_SCORE, MAX_STATIC_SCORE)
+        };
+        if !in_check {
+            moves.retain(|chess_move| chess_move.is_capture() || chess_move.promotion().is_some());
+        }
+        for chess_move in moves {
+            let undo = position.apply_move_unchecked(chess_move);
+            best = best.max(-unpruned_quiescence(
+                position,
+                evaluator,
+                ply + 1,
+                quiescence_ply + 1,
+                nodes,
+            ));
+            position.unmake_move(undo);
+        }
+        best
+    }
+
     fn unpruned(
         position: &mut Position,
         evaluator: &dyn Evaluator,
         depth: u8,
-        ply: u8,
+        ply: u16,
         nodes: &mut u64,
     ) -> i32 {
+        if depth == 0 {
+            return unpruned_quiescence(position, evaluator, ply, 0, nodes);
+        }
         *nodes += 1;
         let moves = generate_legal_moves_unchecked(position);
         if moves.is_empty() {
@@ -565,13 +1003,6 @@ mod tests {
                 0
             };
         }
-        if depth == 0 {
-            return evaluator
-                .evaluate(position)
-                .centipawns()
-                .clamp(-MAX_STATIC_SCORE, MAX_STATIC_SCORE);
-        }
-
         let mut best = -INFINITY;
         for chess_move in moves {
             let undo = position.apply_move_unchecked(chess_move);

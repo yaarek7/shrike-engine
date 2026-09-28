@@ -17,6 +17,8 @@ fn public_search_result_is_legal_replayable_and_deterministic() {
 
     assert_eq!(first, second);
     assert!(first.nodes() > 1);
+    assert!(first.quiescence_nodes() > 0);
+    assert!(first.nodes() >= first.quiescence_nodes());
     assert!(first.principal_variation().len() <= 3);
     assert_eq!(
         first.best_move(),
@@ -27,6 +29,19 @@ fn public_search_result_is_legal_replayable_and_deterministic() {
     for &chess_move in first.principal_variation() {
         replay.make_move(chess_move).expect("PV move is legal");
     }
+}
+
+#[test]
+fn public_search_uses_quiescence_without_extending_the_reported_pv() {
+    let position = Position::from_fen("4k3/8/5n2/3p4/8/8/8/3QK3 w - - 0 1").expect("valid FEN");
+    let result = search(&position, &ClassicalEvaluator, 1).expect("search succeeds");
+
+    assert_ne!(
+        result.best_move().map(Move::to_uci).as_deref(),
+        Some("d1d5")
+    );
+    assert_eq!(result.principal_variation().len(), 1);
+    assert!(result.quiescence_nodes() > 0);
 }
 
 #[test]

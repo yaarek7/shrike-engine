@@ -451,7 +451,7 @@ fn king_square(position: &Position, color: Color) -> Square {
         .expect("validated position has exactly one king")
 }
 
-fn is_in_check_unchecked(position: &Position, color: Color) -> bool {
+pub(crate) fn is_in_check_unchecked(position: &Position, color: Color) -> bool {
     is_square_attacked(position, king_square(position, color), color.opposite())
 }
 
