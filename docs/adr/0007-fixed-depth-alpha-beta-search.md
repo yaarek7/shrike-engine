@@ -15,7 +15,8 @@ generation and make/unmake, while avoiding repeated validation at every search n
 The baseline search is depth-limited negamax with alpha-beta pruning. The public entry point
 validates and clones the root once; descendants use crate-private legal generation and
 make/unmake operations whose invariants are established by the validated root and legal moves.
-The evaluator is injected through the existing trait.
+The current correctness-first undo record snapshots the position at every move, so search still
+incurs per-node cloning internally. The evaluator is injected through the existing trait.
 
 Terminal detection precedes the depth cutoff so checkmate and stalemate are recognized at the
 horizon. Mate scores occupy a band around 900,000 centipawns and encode distance by ply; static
@@ -30,7 +31,8 @@ depth is supplied. Each completed search emits one `info` line followed by exact
 
 - Search behavior is deterministic and directly testable without protocol I/O.
 - Alpha-beta pruning can be measured against an unpruned reference while producing the same score.
-- Cloning only the root and using make/unmake below it avoids per-node position cloning.
+- Make/unmake centralizes state restoration, but the current full-position undo snapshot still
+  clones at each searched move. Compact delta-based undo is deferred until profiling work.
 - The baseline has no quiescence search, iterative deepening, time control, repetition detection,
   transposition table, or sophisticated ordering; those remain explicit future milestones.
 - Principal variations allocate vectors at nodes. This is acceptable for the correctness baseline
