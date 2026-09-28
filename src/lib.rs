@@ -8,6 +8,8 @@
 
 /// Chess-domain types and position representation.
 pub mod chess;
+/// Universal Chess Interface protocol support.
+pub mod uci;
 
 /// Metadata identifying this engine build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,6 +18,8 @@ pub struct EngineInfo {
     pub name: &'static str,
     /// Package version supplied by Cargo.
     pub version: &'static str,
+    /// Package author supplied by Cargo.
+    pub author: &'static str,
 }
 
 impl EngineInfo {
@@ -23,8 +27,9 @@ impl EngineInfo {
     #[must_use]
     pub const fn current() -> Self {
         Self {
-            name: "Chess Engine",
+            name: "Shrike Engine",
             version: env!("CARGO_PKG_VERSION"),
+            author: env!("CARGO_PKG_AUTHORS"),
         }
     }
 }
@@ -37,7 +42,8 @@ mod tests {
     fn current_engine_info_matches_package_metadata() {
         let info = EngineInfo::current();
 
-        assert_eq!(info.name, "Chess Engine");
+        assert_eq!(info.name, "Shrike Engine");
         assert_eq!(info.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(info.author, "yaarek7");
     }
 }

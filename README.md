@@ -5,9 +5,9 @@ development process.
 
 ## Status
 
-Milestone M3 is complete: the engine has validated orthodox positions, attack detection, complete
-legal move generation, exact make/unmake, and a canonical perft regression suite. UCI protocol
-support begins in the next milestone.
+Milestone M4 is complete: the engine has validated orthodox chess rules and a functional UCI
+process supporting handshake, readiness, new-game notification, FEN/start-position setup, legal move
+application, `go`, `stop`, and `quit`. Move choice remains deterministic until search arrives.
 
 ## Requirements
 

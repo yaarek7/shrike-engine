@@ -2,8 +2,19 @@
 
 #![forbid(unsafe_code)]
 
-fn main() {
-    // Protocol handling will be introduced as a library API in the UCI milestone.
-    // Until then, the binary intentionally has no observable behavior.
-    let _engine = chess_engine::EngineInfo::current();
+use std::{io, process::ExitCode};
+
+fn main() -> ExitCode {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut reader = stdin.lock();
+    let mut writer = io::BufWriter::new(stdout.lock());
+
+    match chess_engine::uci::run(&mut reader, &mut writer) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("UCI I/O error: {error}");
+            ExitCode::FAILURE
+        }
+    }
 }
