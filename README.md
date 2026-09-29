@@ -50,3 +50,9 @@ cargo fmt --all
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and
 [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) for the working agreements.
+
+Strength evaluation and evolution are documented separately:
+[`TESTING.md`](TESTING.md) (match workflow),
+[`VERSIONING.md`](VERSIONING.md) (versions vs ratings), and
+[`EXPERIMENTS.md`](EXPERIMENTS.md) with records in
+[`docs/experiments/`](docs/experiments/).

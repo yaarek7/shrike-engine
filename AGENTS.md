@@ -10,6 +10,8 @@ Read only the files routed by the change. Do not load all ADRs or the full test 
   `src/search/AGENTS.md`.
 - UCI parsing, clocks, worker lifecycle, protocol output: `src/uci/mod.rs` and `tests/uci.rs`.
 - Stable architecture decisions: newest relevant file under `docs/adr/`; do not read unrelated ADRs.
+- Strength experiments and ratings: `EXPERIMENTS.md`, `VERSIONING.md`, and records under
+  `docs/experiments/`; match workflow in `TESTING.md`.
 
 ## Required discipline
 

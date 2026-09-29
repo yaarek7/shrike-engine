@@ -1,7 +1,7 @@
 /target/
+/matches/
 *.profraw
 *.profdata
 .DS_Store
 .idea/
 .vscode/
-
