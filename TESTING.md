@@ -146,6 +146,26 @@ For a more transferable final result, repeat the comparison at a longer time con
 `60+0.6`; Stockfish's `UCI_Elo` is only an approximate external rating anchor and depends on the
 time control and testing environment.
 
+## Parallelism
+
+Games are independent, so Fastchess `-concurrency` scales throughput almost linearly. Each game
+runs two single-threaded engines, loading roughly two hardware threads, so keep concurrency at
+about half the thread count minus headroom for the OS and controller.
+
+Validated default on the 12-thread M6 Mac mini: `-concurrency 4` (2026-09-28: 20 games in 2:18,
+20/20 normal terminations, 0 forfeits, 40% vs the 38% serial baseline with overlapping Elo
+intervals; see `matches/sf1500-c4-summary.md`). Use it in place of `-concurrency 1` in the
+command above.
+
+Rules:
+
+- Concurrency is part of the environment: fixed throughout a comparison and recorded in the
+  experiment record. Never mix results across concurrency levels in one decision.
+- Earlier serial results (for example the SF1500 bracket) remain valid standalone ratings.
+- Re-validate before raising concurrency or moving hosts: a 20-40 game run must show no
+  Shrike-side forfeits, stalls, or crashes, no forfeit-rate spike over baseline, and no score
+  drift beyond noise.
+
 ## Current starting point
 
 Commit `2333fde` was tested for 20 games against Stockfish 19 configured at `UCI_Elo=1320` and

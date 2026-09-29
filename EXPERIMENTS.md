@@ -94,6 +94,7 @@ re-testing a dead idea. See `docs/experiments/README.md` for the format.
   report the draw rate alongside every result.
 - Time control is part of the claim: `+15 @ 10+0.1` may vanish at `60+0.6`.
   Never generalize across controls without measuring.
-- Environment is part of the setup: same machine, same load, one concurrency
-  unless a higher value was validated for timing stability.
+- Environment is part of the setup: same machine, same load, same Fastchess concurrency
+  (validated default on the M6 host: 4; see `TESTING.md`). Never mix concurrency levels within
+  one comparison.
 - When in doubt, re-run the baseline rather than trusting a stale number.
